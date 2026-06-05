@@ -184,6 +184,12 @@
       renderResults(mod, AppState.results[mod]);
       // Draw ROIs client-side on overlay
       drawRoisOnOverlay(AppState.results[mod].results);
+      const runBtn = document.getElementById("btn-run");
+      if (runBtn) {
+        runBtn.textContent = "Fatto";
+        runBtn.className = "btn btn-secondary";
+        runBtn.dataset.mode = "done";
+      }
     }
 
     // Bind controls
@@ -196,7 +202,17 @@
       sel.addEventListener("change", () => { document.getElementById("snr-second-slice-wrap").classList.toggle("hidden", sel.value !== "two_image"); });
     }
 
-    document.getElementById("btn-run").addEventListener("click", () => runAnalysis(mod));
+    document.getElementById("btn-run").addEventListener("click", () => {
+      const btn = document.getElementById("btn-run");
+      if (btn?.dataset.mode === "done") {
+        const ts = document.getElementById(`ts-${mod}`);
+        const passed = AppState.results[mod]?.results?.passed;
+        if (ts) ts.className = `tab-status ${passed === false ? "fail" : "pass"}`;
+        UI.setStatus(`${AppState.moduleLabels[mod]} confermato`);
+        return;
+      }
+      runAnalysis(mod);
+    });
     document.getElementById("btn-reset-roi").addEventListener("click", () => { showModule(mod); });
   }
 
@@ -260,11 +276,35 @@
 
     // Helper: text with dark outline
     function strokeText(text, x, y, color, font = "bold 10px sans-serif", align = "center", baseline = "bottom") {
+      if (typeof text === "string" && (text.startsWith("Rampa") || text.startsWith("FWHM="))) return;
       ctx.save();
       ctx.font = font; ctx.textAlign = align; ctx.textBaseline = baseline;
       ctx.strokeStyle = "#000"; ctx.lineWidth = 3; ctx.lineJoin = "round";
       ctx.strokeText(text, x, y);
       ctx.fillStyle = color; ctx.fillText(text, x, y);
+      ctx.restore();
+    }
+
+    function labelBox(text, x, y, color, font = "bold 10px sans-serif", align = "center") {
+      ctx.save();
+      ctx.font = font;
+      const metrics = ctx.measureText(text);
+      const padX = 4, padY = 3;
+      const boxW = metrics.width + padX * 2;
+      const boxH = 20;
+      let bx = align === "left" ? x : align === "right" ? x - boxW : x - boxW / 2;
+      let by = y - boxH / 2;
+      bx = Math.max(2, Math.min(overlay.width - boxW - 2, bx));
+      by = Math.max(2, Math.min(overlay.height - boxH - 2, by));
+      ctx.fillStyle = "rgba(15,23,42,0.82)";
+      ctx.strokeStyle = "rgba(255,255,255,0.25)";
+      ctx.lineWidth = 1;
+      ctx.fillRect(bx, by, boxW, boxH);
+      ctx.strokeRect(bx, by, boxW, boxH);
+      ctx.fillStyle = color;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(text, bx + boxW / 2, by + boxH / 2);
       ctx.restore();
     }
 
@@ -434,6 +474,30 @@
       if (r.top_ramp_length_mm !== undefined) {
         strokeText(`FWHM=${r.top_ramp_length_mm.toFixed(1)}mm`, tx + tw/2, ty + th + 12, "#22d3ee", "9px monospace");
         strokeText(`FWHM=${r.bottom_ramp_length_mm.toFixed(1)}mm`, bx + bw/2, by + bh + 12, "#fb923c", "9px monospace");
+        labelBox(`Top ${r.top_ramp_length_mm.toFixed(1)} mm`, tx + tw/2, ty - 12, "#22d3ee", "bold 10px sans-serif");
+        labelBox(`Bottom ${r.bottom_ramp_length_mm.toFixed(1)} mm`, bx + bw/2, by + bh + 14, "#fb923c", "bold 10px sans-serif");
+      }
+      const profs = r.slice_thickness_profiles;
+      if (profs) {
+        for (const [key, prof] of Object.entries(profs)) {
+          const color = key === "top" ? "#22d3ee" : "#fb923c";
+          const l = prof.left_rc;
+          const rr = prof.right_rc;
+          if (!l || !rr) continue;
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2.5;
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          ctx.moveTo(l[1], l[0]);
+          ctx.lineTo(rr[1], rr[0]);
+          ctx.stroke();
+          ctx.fillStyle = "#ef4444";
+          for (const p of [l, rr]) {
+            ctx.beginPath();
+            ctx.arc(p[1], p[0], 3.2, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
       }
       // Title
       const color = r.passed ? "#22c55e" : "#ef4444";
@@ -452,11 +516,29 @@
         const [gy, gx, gh, gw] = r.grid_rects[i];
         const color = resolved[i] ? "#22c55e" : "#ef4444";
         drawRect(gy, gx, gh, gw, color, 2);
-        strokeText(labels[i], gx + gw/2, gy - 4, color, "bold 9px sans-serif");
-        strokeText(`mod=${(mods[i]||0).toFixed(3)}`, gx + gw/2, gy + gh + 12, color, "8px monospace");
+        labelBox(labels[i], gx + gw/2, gy - 12, color, "bold 9px sans-serif");
+        labelBox(`m=${(mods[i]||0).toFixed(2)}`, gx + gw/2, gy + gh + 14, color, "8px monospace");
+        const mip = r.resolution_mip?.[i];
+        if (mip) {
+          ctx.fillStyle = "#ef4444";
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = 1;
+          const peaks = [
+            ...(mip.horizontal?.peaks || []),
+            ...(mip.vertical?.peaks || []),
+          ];
+          for (const peak of peaks) {
+            if (peak.row === undefined || peak.col === undefined) continue;
+            ctx.beginPath();
+            ctx.arc(peak.col, peak.row, 2.8, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+          }
+        }
       }
       const resColor = r.passed ? "#22c55e" : "#ef4444";
-      strokeText(`Risoluzione = ${r.resolved_mm} mm`, overlay.width/2, 14, resColor, "bold 11px sans-serif", "center", "top");
+      const resText = r.resolved_mm === null || r.resolved_mm === undefined ? "Risoluzione assistita" : `Risoluzione = ${r.resolved_mm} mm`;
+      strokeText(resText, overlay.width/2, 14, resColor, "bold 11px sans-serif", "center", "top");
     }
 
     // ── Low contrast: visible count + spoke positions ──
@@ -736,7 +818,12 @@
       const passed = resp.results?.passed;
       const ts = document.getElementById(`ts-${mod}`);
       if (ts) ts.className = `tab-status ${passed === false ? "fail" : "pass"}`;
-      if (btn) { btn.textContent = "✓ Fatto"; btn.className = "btn btn-secondary"; btn.disabled = false; }
+      if (btn) {
+        btn.textContent = "Fatto";
+        btn.className = "btn btn-secondary";
+        btn.disabled = false;
+        btn.dataset.mode = "done";
+      }
       UI.setStatus(`✓ ${AppState.moduleLabels[mod]}`);
     } catch (err) {
       if (btn) { btn.disabled = false; btn.textContent = "⚡ Riprova"; }
@@ -823,13 +910,54 @@
         <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">Spessore</span><span class="summary-value">${UI.fmt(r.measured_thickness_mm,2)} mm</span></div>
         <div class="summary-row info"><span class="summary-label">Nominale</span><span class="summary-value">${r.nominal_thickness_mm||5} mm</span></div>
         <div class="summary-row info"><span class="summary-label">Rampa sup/inf</span><span class="summary-value">${UI.fmt(r.top_ramp_length_mm,2)} / ${UI.fmt(r.bottom_ramp_length_mm,2)} mm</span></div>
+        <div class="summary-row info"><span class="summary-label">Segnale medio rampe</span><span class="summary-value">${UI.fmt(r.ramp_signal_mean,1)} (soglia ${UI.fmt(r.ramp_threshold,1)})</span></div>
+        <div class="summary-row info"><span class="summary-label">Formula ACR</span><span class="summary-value">0.2*T*B/(T+B)</span></div>
       </div>`;
+      if (r.slice_thickness_profiles) {
+        html += `<div class="result-section">
+          <h4>Profili rampe</h4>
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">Profilo grezzo medio per colonna, senza filtro. Soglia = meta del segnale medio nelle ROI, come da manuale ACR.</div>
+          <canvas id="slice-thickness-profile-chart" width="760" height="230" style="width:100%;height:230px;border-radius:6px;background:#0f172a;"></canvas>
+      </div>`;
+      }
     } else if (mod === "slice_position") {
       html = `<div class="result-section">
         <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">Errore posizione</span><span class="summary-value">${UI.fmt(r.slice_position_error_mm,2)} mm</span></div>
         <div class="summary-row info"><span class="summary-label">Barra 1 / 2</span><span class="summary-value">${UI.fmt(r.bar_length_1_mm,2)} / ${UI.fmt(r.bar_length_2_mm,2)} mm</span></div>
       </div>`;
     } else if (mod === "resolution") {
+      html = `<div class="result-section">
+        <div class="summary-row info"><span class="summary-label">Modalita</span><span class="summary-value">assistita MIP + picchi</span></div>
+        <div class="summary-row info"><span class="summary-label">Valutazione</span><span class="summary-value">manuale sui picchi H/V</span></div>
+      </div>`;
+      if (r.grid_rects && r.grid_rects.length > 0) {
+        const labels = ["1.1 mm", "1.0 mm", "0.9 mm"];
+        const mods = [r.modulation_1_1mm, r.modulation_1_0mm, r.modulation_0_9mm];
+        const manualTicks = r.manual_resolution_ticks || {};
+        html += `<div class="result-section"><h4>Registrazione visiva</h4><div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px;">`;
+        for (let i = 0; i < labels.length; i++) {
+          const checked = manualTicks[labels[i]] === true;
+          html += `<label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;"><input type="checkbox" class="resolution-manual-tick" data-target="${labels[i]}" ${checked ? "checked" : ""}>${labels[i]}</label>`;
+        }
+        html += `</div><table class="result-table"><thead><tr><th>Target</th><th>ROI y,x,h,w</th><th>Picchi H/V</th><th>Mod.</th></tr></thead><tbody>`;
+        for (let i = 0; i < r.grid_rects.length; i++) {
+          const mip = r.resolution_mip?.[i];
+          const hc = mip?.horizontal?.count ?? 0;
+          const vc = mip?.vertical?.count ?? 0;
+          html += `<tr><td>${labels[i]}</td><td>${r.grid_rects[i].join(", ")}</td><td>${hc} / ${vc}</td><td>${UI.fmt(mods[i],4)}</td></tr>`;
+        }
+        html += `</tbody></table></div>`;
+      }
+      if (r.resolution_mip && r.resolution_mip.length > 0) {
+        html += `<div class="result-section"><h4>Profili MIP H / V</h4>`;
+        for (let i = 0; i < r.resolution_mip.length; i++) {
+          const target = r.resolution_mip[i].target_mm;
+          html += `<div style="font-size:12px;font-weight:600;color:var(--text-secondary);margin:12px 0 4px;">${target.toFixed(1)} mm</div>
+            <canvas class="resolution-mip-chart" id="resolution-mip-${i}" width="760" height="190" style="width:100%;height:190px;border-radius:6px;background:#0f172a;"></canvas>`;
+        }
+        html += `</div>`;
+      }
+    } else if (false && mod === "resolution") {
       html = `<div class="result-section">
         <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">Risoluzione</span><span class="summary-value">${r.resolved_mm||"—"} mm</span></div>
       </div>`;
@@ -851,10 +979,182 @@
       html = `<div class="result-section"><pre style="font-size:10px;overflow:auto;max-height:200px;">${JSON.stringify(r,null,2)}</pre></div>`;
     }
     area.innerHTML = html;
+    if (mod === "resolution") {
+      for (const input of area.querySelectorAll(".resolution-manual-tick")) {
+        input.addEventListener("change", () => {
+          const current = AppState.results[mod]?.results;
+          if (!current) return;
+          current.manual_resolution_ticks = current.manual_resolution_ticks || {};
+          current.manual_resolution_ticks[input.dataset.target] = input.checked;
+        });
+      }
+    }
 
     // Draw SNRU bar chart if applicable
     if (mod === "snru" && r.rois) setTimeout(() => drawSnruChart(r), 50);
     if (mod === "geometric" && r.geometric_profiles) setTimeout(() => drawGeometricProfileChart(r), 50);
+    if (mod === "resolution" && r.resolution_mip) setTimeout(() => drawResolutionMipCharts(r), 50);
+    if (mod === "slice_thickness" && r.slice_thickness_profiles) setTimeout(() => drawSliceThicknessProfileChart(r), 50);
+  }
+
+  function drawSliceThicknessProfileChart(r) {
+    const canvas = document.getElementById("slice-thickness-profile-chart"); if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width, H = canvas.height;
+    const pad = { l: 42, r: 16, t: 18, b: 30 };
+    const profiles = [
+      { label: "Top", color: "#22d3ee", p: r.slice_thickness_profiles?.top },
+      { label: "Bottom", color: "#fb923c", p: r.slice_thickness_profiles?.bottom },
+    ].filter(s => s.p?.values?.length > 1);
+    if (!profiles.length) return;
+    const vals = profiles.flatMap(s => s.p.values);
+    const yMin = Math.min(...vals);
+    const yMax = Math.max(...vals);
+    const xMin = Math.min(...profiles.flatMap(s => s.p.x_mm || []));
+    const xMax = Math.max(...profiles.flatMap(s => s.p.x_mm || []));
+    const toX = x => pad.l + (x - xMin) / Math.max(1e-6, xMax - xMin) * (W - pad.l - pad.r);
+    const toY = y => H - pad.b - (y - yMin) / Math.max(1e-6, yMax - yMin) * (H - pad.t - pad.b);
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "#0f172a"; ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = "rgba(148,163,184,.35)"; ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.t + i * (H - pad.t - pad.b) / 4;
+      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+    }
+    ctx.strokeStyle = "#64748b";
+    ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, H - pad.b); ctx.lineTo(W - pad.r, H - pad.b); ctx.stroke();
+
+    for (const s of profiles) {
+      const x = s.p.x_mm;
+      const y = s.p.values;
+      const ys = s.p.smoothed || [];
+      const hasDifferentSmooth = ys.length === y.length && ys.some((v, i) => Math.abs(v - y[i]) > 1e-6);
+      if (hasDifferentSmooth) {
+        ctx.globalAlpha = 0.4;
+        ctx.strokeStyle = s.color; ctx.lineWidth = 1.2; ctx.beginPath();
+        for (let i = 0; i < ys.length; i++) {
+          const px = toX(x[i]), py = toY(ys[i]);
+          if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.stroke(); ctx.globalAlpha = 1;
+      }
+      ctx.strokeStyle = s.color; ctx.lineWidth = 2.2; ctx.beginPath();
+      for (let i = 0; i < y.length; i++) {
+        const px = toX(x[i]), py = toY(y[i]);
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      if (s.p.threshold !== undefined) {
+        ctx.save(); ctx.setLineDash([5,4]); ctx.globalAlpha = 0.55;
+        const ty = toY(s.p.threshold);
+        ctx.beginPath(); ctx.moveTo(pad.l, ty); ctx.lineTo(W - pad.r, ty); ctx.stroke();
+        ctx.restore();
+      }
+      ctx.fillStyle = "#ef4444"; ctx.strokeStyle = "#fff"; ctx.lineWidth = 1;
+      for (const edge of [s.p.left_px, s.p.right_px]) {
+        if (edge === null || edge === undefined) continue;
+        const idx = Math.max(0, Math.min(x.length - 1, Math.round(edge)));
+        ctx.beginPath(); ctx.arc(toX(x[idx]), toY(y[idx]), 4, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      }
+    }
+    ctx.font = "11px sans-serif"; ctx.textAlign = "left";
+    ctx.fillStyle = "#22d3ee"; ctx.fillText(`Top ${UI.fmt(r.top_ramp_length_mm,1)} mm`, pad.l + 8, 13);
+    ctx.fillStyle = "#fb923c"; ctx.fillText(`Bottom ${UI.fmt(r.bottom_ramp_length_mm,1)} mm`, pad.l + 110, 13);
+    ctx.fillStyle = "#cbd5e1"; ctx.textAlign = "right";
+    ctx.fillText(`Spessore ${UI.fmt(r.measured_thickness_mm,2)} mm`, W - pad.r, 13);
+  }
+
+  function drawResolutionMipCharts(r) {
+    if (!Array.isArray(r.resolution_mip)) return;
+    for (let i = 0; i < r.resolution_mip.length; i++) {
+      const canvas = document.getElementById(`resolution-mip-${i}`);
+      if (!canvas) continue;
+      const item = r.resolution_mip[i];
+      const ctx = canvas.getContext("2d");
+      const W = canvas.width, H = canvas.height;
+      const pad = { l: 34, r: 12, t: 14, b: 24 };
+      const hProf = item.horizontal || {};
+      const vProf = item.vertical || {};
+      const series = [
+        { label: "H", color: "#f97316", data: hProf.values || [], smooth: hProf.smoothed || [], peaks: hProf.peaks || [], threshold: hProf.threshold },
+        { label: "V", color: "#3b82f6", data: vProf.values || [], smooth: vProf.smoothed || [], peaks: vProf.peaks || [], threshold: vProf.threshold },
+      ].filter(s => s.data.length > 1);
+      if (!series.length) continue;
+
+      const yVals = series.flatMap(s => s.data);
+      const yMin = Math.min(...yVals);
+      const yMax = Math.max(...yVals);
+      const xMax = Math.max(...series.map(s => s.data.length - 1));
+      const toX = x => pad.l + x / Math.max(1, xMax) * (W - pad.l - pad.r);
+      const toY = y => H - pad.b - (y - yMin) / Math.max(1e-6, yMax - yMin) * (H - pad.t - pad.b);
+
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = "#0f172a";
+      ctx.fillRect(0, 0, W, H);
+      ctx.strokeStyle = "rgba(148,163,184,.35)";
+      ctx.lineWidth = 1;
+      for (let g = 0; g <= 4; g++) {
+        const y = pad.t + g * (H - pad.t - pad.b) / 4;
+        ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+      }
+      ctx.strokeStyle = "#64748b";
+      ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, H - pad.b); ctx.lineTo(W - pad.r, H - pad.b); ctx.stroke();
+
+      for (const s of series) {
+        if (s.smooth.length === s.data.length) {
+          ctx.globalAlpha = 0.35;
+          ctx.strokeStyle = s.color;
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          for (let j = 0; j < s.smooth.length; j++) {
+            const x = toX(j), y = toY(s.smooth[j]);
+            if (j === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+        ctx.strokeStyle = s.color;
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        for (let j = 0; j < s.data.length; j++) {
+          const x = toX(j), y = toY(s.data[j]);
+          if (j === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+
+        if (s.threshold !== undefined) {
+          ctx.globalAlpha = 0.55;
+          ctx.setLineDash([3, 3]);
+          const ty = toY(s.threshold);
+          ctx.beginPath(); ctx.moveTo(pad.l, ty); ctx.lineTo(W - pad.r, ty); ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.globalAlpha = 1;
+        }
+
+        ctx.fillStyle = "#ef4444";
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 1;
+        for (const peak of s.peaks) {
+          const px = toX(peak.index);
+          const py = toY(s.data[Math.max(0, Math.min(s.data.length - 1, peak.index))]);
+          ctx.beginPath();
+          ctx.arc(px, py, 3.2, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+      }
+
+      ctx.font = "10px sans-serif";
+      ctx.fillStyle = "#cbd5e1";
+      ctx.fillText(`H ${hProf.count || 0}`, pad.l + 6, 11);
+      ctx.fillStyle = "#93c5fd";
+      ctx.fillText(`V ${vProf.count || 0}`, pad.l + 48, 11);
+      ctx.fillStyle = "#cbd5e1";
+      ctx.textAlign = "right";
+      ctx.fillText(`${item.target_mm.toFixed(1)} mm`, W - pad.r, 11);
+      ctx.textAlign = "left";
+    }
   }
 
   function drawGeometricProfileChart(r) {

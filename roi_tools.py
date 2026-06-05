@@ -805,7 +805,8 @@ def calculate_geometric_accuracy(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
 
 def calculate_slice_thickness(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
                               center_rc=None, radius_px=None,
-                              nominal_thickness_mm: float = 5.0):
+                              nominal_thickness_mm: float = 5.0,
+                              top_ramp_rect=None, bot_ramp_rect=None):
     """
     Misura l'accuratezza dello spessore di strato usando le rampe incrociate
     nella slice #1 del phantom ACR.
@@ -829,7 +830,7 @@ def calculate_slice_thickness(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
         dict con risultati
     """
     h, w = arr.shape
-    px = pixel_spacing_mm
+    px = float(pixel_spacing_mm)
 
     if center_rc is None or radius_px is None:
         cr, cc, r0 = find_phantom_circle(arr, pixel_spacing_mm)
@@ -842,38 +843,103 @@ def calculate_slice_thickness(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
     # Le rampe sono tipicamente ±10-15 pixel sopra e sotto il centro
 
     # Profilo della rampa superiore (sopra il centro, ~10 px)
-    ramp_offset = max(5, int(10.0 / px))
-    ramp_width = max(3, int(5.0 / px))  # larghezza della banda di averaging
+    cr = int(np.clip(round(cr), 0, h - 1))
+    cc = int(np.clip(round(cc), 0, w - 1))
+    r0 = float(r0)
 
-    # Rampa superiore: media di alcune righe sopra il centro
-    top_band = arr[cr - ramp_offset - ramp_width:cr - ramp_offset, :]
-    if top_band.size > 0:
-        top_profile = np.mean(top_band, axis=0)
-    else:
-        top_profile = arr[cr - ramp_offset, :]
+    def _clamp_rect(rect):
+        y, x, rh, rw = [int(round(v)) for v in rect]
+        y = max(0, min(h - 1, y))
+        x = max(0, min(w - 1, x))
+        rh = max(1, min(h - y, rh))
+        rw = max(1, min(w - x, rw))
+        return [y, x, rh, rw]
 
-    # Rampa inferiore: media di alcune righe sotto il centro
-    bot_band = arr[cr + ramp_offset:cr + ramp_offset + ramp_width, :]
-    if bot_band.size > 0:
-        bot_profile = np.mean(bot_band, axis=0)
-    else:
-        bot_profile = arr[cr + ramp_offset, :]
+    def _default_rects():
+        ramp_h = max(2, int(round(3.0 / max(px, 1e-6))))
+        ramp_w = max(24, int(round(78.0 / max(px, 1e-6))))
+        ramp_w = min(ramp_w, max(24, int(round(0.85 * r0))))
+        offset = max(5, int(round(10.0 / max(px, 1e-6))))
+        x0 = cc - ramp_w / 2
+        return (
+            _clamp_rect([cr - offset - ramp_h, x0, ramp_h, ramp_w]),
+            _clamp_rect([cr + offset, x0, ramp_h, ramp_w]),
+        )
 
-    def _fwhm_length(profile, px_mm):
-        """Calcola la lunghezza FWHM di un profilo."""
+    default_top, default_bot = _default_rects()
+    top_ramp_rect = _clamp_rect(top_ramp_rect) if top_ramp_rect else default_top
+    bot_ramp_rect = _clamp_rect(bot_ramp_rect) if bot_ramp_rect else default_bot
+
+    def _profile_from_rect(rect):
+        y, x, rh, rw = rect
+        roi = arr[y:y + rh, x:x + rw]
+        profile = np.mean(roi, axis=0) if roi.size else np.array([], dtype=float)
+        return roi, profile
+
+    top_roi, top_profile = _profile_from_rect(top_ramp_rect)
+    bot_roi, bot_profile = _profile_from_rect(bot_ramp_rect)
+
+    top_mean = float(np.mean(top_roi)) if top_roi.size else 0.0
+    bot_mean = float(np.mean(bot_roi)) if bot_roi.size else 0.0
+    avg_ramp_signal = (top_mean + bot_mean) / 2.0 if (top_mean > 0 or bot_mean > 0) else 0.0
+    ramp_threshold = 0.5 * avg_ramp_signal
+
+    def _smooth_profile(profile):
+        profile = np.asarray(profile, dtype=np.float64)
+        if profile.size < 5:
+            return profile
+        kernel = np.array([1, 2, 3, 2, 1], dtype=np.float64)
+        kernel /= kernel.sum()
+        return np.convolve(profile, kernel, mode="same")
+
+    def _measure_length(profile, threshold):
+        profile = np.asarray(profile, dtype=np.float64)
         if profile.size == 0:
-            return 0.0
-        peak = np.max(profile)
-        bg = np.min(profile)
-        half_max = (peak + bg) / 2.0
-        above = np.where(profile >= half_max)[0]
+            return 0.0, None, None, np.array([], dtype=float), threshold
+        # ACR asks for a visual threshold measurement. Use the raw profile for
+        # the threshold crossing; smoothing can shift ragged ramp ends.
+        smoothed = profile.copy()
+        use_threshold = threshold
+        if use_threshold <= 0 or float(np.max(smoothed)) < use_threshold:
+            bg = float(np.percentile(smoothed, 10))
+            peak = float(np.percentile(smoothed, 95))
+            use_threshold = bg + 0.5 * (peak - bg)
+        above = np.where(smoothed >= use_threshold)[0]
         if len(above) < 2:
-            return 0.0
-        length_px = above[-1] - above[0]
-        return length_px * px_mm
+            return 0.0, None, None, smoothed, use_threshold
 
-    top_length_mm = _fwhm_length(top_profile, px)
-    bot_length_mm = _fwhm_length(bot_profile, px)
+        def _cross(edge_idx, neighbor_idx):
+            x0, x1 = float(neighbor_idx), float(edge_idx)
+            y0, y1 = float(smoothed[neighbor_idx]), float(smoothed[edge_idx])
+            if abs(y1 - y0) < 1e-9:
+                return x1
+            return x0 + (use_threshold - y0) * (x1 - x0) / (y1 - y0)
+
+        left_i = int(above[0])
+        right_i = int(above[-1])
+        left = _cross(left_i, left_i - 1) if left_i > 0 else float(left_i)
+        right = _cross(right_i, right_i + 1) if right_i < len(smoothed) - 1 else float(right_i)
+        if right <= left:
+            left, right = float(left_i), float(right_i)
+        return float((right - left) * px), float(left), float(right), smoothed, use_threshold
+
+    top_length_mm, top_left, top_right, top_smooth, top_threshold = _measure_length(top_profile, ramp_threshold)
+    bot_length_mm, bot_left, bot_right, bot_smooth, bot_threshold = _measure_length(bot_profile, ramp_threshold)
+
+    def _pack_profile(rect, profile, smooth, left, right, threshold):
+        y, x, rh, rw = rect
+        return {
+            "rect": rect,
+            "x_mm": [round(float((i - (rw - 1) / 2) * px), 3) for i in range(rw)],
+            "values": [round(float(v), 3) for v in np.asarray(profile, dtype=float)],
+            "smoothed": [round(float(v), 3) for v in np.asarray(smooth, dtype=float)],
+            "threshold": round(float(threshold), 3),
+            "left_px": None if left is None else round(float(left), 3),
+            "right_px": None if right is None else round(float(right), 3),
+            "left_rc": None if left is None else [round(float(y + rh / 2), 2), round(float(x + left), 2)],
+            "right_rc": None if right is None else [round(float(y + rh / 2), 2), round(float(x + right), 2)],
+            "mean_signal": round(float(np.mean(arr[y:y + rh, x:x + rw])), 3),
+        }
 
     # Spessore: formula ACR per rampe incrociate a 45°
     # thickness = 0.2 × (L_top × L_bot) / (L_top + L_bot)
@@ -895,10 +961,20 @@ def calculate_slice_thickness(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
         "error_mm": round(error_mm, 2),
         "top_ramp_length_mm": round(top_length_mm, 2),
         "bottom_ramp_length_mm": round(bot_length_mm, 2),
+        "slice_thickness_formula": "0.2 * top * bottom / (top + bottom)",
+        "slice_thickness_formula_factor": 0.2,
         "passed": passed,
         "limit_mm": limit_mm,
         "center_rc": (cr, cc),
         "radius_px": r0,
+        "top_ramp_rect": top_ramp_rect,
+        "bot_ramp_rect": bot_ramp_rect,
+        "ramp_signal_mean": round(float(avg_ramp_signal), 3),
+        "ramp_threshold": round(float(ramp_threshold), 3),
+        "slice_thickness_profiles": {
+            "top": _pack_profile(top_ramp_rect, top_profile, top_smooth, top_left, top_right, top_threshold),
+            "bottom": _pack_profile(bot_ramp_rect, bot_profile, bot_smooth, bot_left, bot_right, bot_threshold),
+        },
     }
 
 
@@ -1026,10 +1102,6 @@ def calculate_spatial_resolution(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
         cr, cc = center_rc
         r0 = radius_px
 
-    # Le griglie di risoluzione sono nella parte superiore della slice #1
-    # Tipicamente a ~50-60 mm sopra il centro del phantom
-    # Ci sono 3 set: UL (1.1mm), UR (1.0mm), LR (0.9mm)
-
     def _clamp_rect(rect):
         y, x, rh, rw = [int(round(v)) for v in rect]
         y = max(0, min(h - 1, y))
@@ -1038,18 +1110,71 @@ def calculate_spatial_resolution(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
         rw = max(1, min(w - x, rw))
         return [y, x, rh, rw]
 
+    def _runs(mask, min_len=1):
+        runs = []
+        start = None
+        for i, val in enumerate(mask):
+            if val and start is None:
+                start = i
+            elif not val and start is not None:
+                if i - start >= min_len:
+                    runs.append((start, i))
+                start = None
+        if start is not None and len(mask) - start >= min_len:
+            runs.append((start, len(mask)))
+        return runs
+
+    def _default_grid_rects():
+        side = max(12, int(round(24.0 / max(px, 1e-6))))
+        side = min(side, max(12, int(round(0.24 * r0))))
+        base_y = cr + 0.30 * r0
+        xs = [cc - 0.27 * r0, cc, cc + 0.27 * r0]
+        return [_clamp_rect([base_y - side / 2, x - side / 2, side, side]) for x in xs]
+
+    def _auto_grid_rects_from_insert():
+        y0 = int(max(0, round(cr + 0.08 * r0)))
+        y1 = int(min(h, round(cr + 0.62 * r0)))
+        x0 = int(max(0, round(cc - 0.65 * r0)))
+        x1 = int(min(w, round(cc + 0.65 * r0)))
+        search = arr[y0:y1, x0:x1]
+        if search.size < 100:
+            return None
+
+        dark_level = float(np.percentile(search, 28))
+        bright_level = float(np.percentile(search, 82))
+        dark_threshold = dark_level + 0.35 * (bright_level - dark_level)
+        dark = search <= dark_threshold
+
+        row_fraction = dark.mean(axis=1)
+        row_runs = _runs(row_fraction > 0.38, min_len=max(6, int(8.0 / max(px, 1e-6))))
+        if not row_runs:
+            return None
+        row_start, row_end = max(row_runs, key=lambda run: (run[1] - run[0], run[0]))
+
+        insert_dark = dark[row_start:row_end, :]
+        col_fraction = insert_dark.mean(axis=0)
+        col_runs = _runs(col_fraction > 0.28, min_len=max(18, int(50.0 / max(px, 1e-6))))
+        if not col_runs:
+            return None
+        col_start, col_end = max(col_runs, key=lambda run: run[1] - run[0])
+
+        iy0, iy1 = y0 + row_start, y0 + row_end
+        ix0, ix1 = x0 + col_start, x0 + col_end
+        ih, iw = iy1 - iy0, ix1 - ix0
+        if ih < 12 or iw < 60:
+            return None
+
+        side = max(12, int(round(24.0 / max(px, 1e-6))))
+        side = min(side, max(12, int(round(0.50 * ih))), max(12, int(round(0.20 * iw))))
+        target_y = iy0 + 0.38 * ih
+        target_fracs = [0.27, 0.50, 0.73]
+        return [_clamp_rect([target_y - side / 2, ix0 + frac * iw - side / 2, side, side])
+                for frac in target_fracs]
+
     if grid_rects and len(grid_rects) >= 3:
         grid_rects = [_clamp_rect(rect) for rect in grid_rects[:3]]
     else:
-        grid_region_top = max(0, cr - int(0.7 * r0))
-        grid_region_bot = max(0, cr - int(0.3 * r0))
-        grid_h = max(1, grid_region_bot - grid_region_top)
-        third = w // 3
-        grid_rects = [
-            _clamp_rect([grid_region_top, 0, grid_h, third]),
-            _clamp_rect([grid_region_top, third, grid_h, third]),
-            _clamp_rect([grid_region_top, 2 * third, grid_h, w - 2 * third]),
-        ]
+        grid_rects = _auto_grid_rects_from_insert() or _default_grid_rects()
 
     grid_regions = [arr[y:y + rh, x:x + rw] for y, x, rh, rw in grid_rects]
 
@@ -1081,16 +1206,124 @@ def calculate_spatial_resolution(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
             return float(local_std / global_mean)
         return 0.0
 
+    def _smooth_profile(profile):
+        profile = np.asarray(profile, dtype=np.float64)
+        if profile.size < 5:
+            return profile
+        kernel = np.array([1, 2, 3, 2, 1], dtype=np.float64)
+        kernel /= kernel.sum()
+        return np.convolve(profile, kernel, mode="same")
+
+    def _detect_mip_peaks(profile, target_mm):
+        profile = np.asarray(profile, dtype=np.float64)
+        if profile.size < 3:
+            return [], 0.0, profile
+        smoothed = _smooth_profile(profile)
+        low = float(np.percentile(profile, 15))
+        high = float(np.percentile(profile, 95))
+        dynamic = max(1e-6, high - low)
+        threshold = low + 0.30 * dynamic
+        min_prom = 0.06 * dynamic
+        min_distance = max(1, int(round(1.25 * target_mm / max(px, 1e-6))))
+
+        candidates = []
+        if len(profile) >= 2 and profile[0] >= threshold and profile[0] >= profile[1]:
+            candidates.append({
+                "index": 0,
+                "value": float(profile[0]),
+                "smoothed": float(smoothed[0]),
+                "prominence": float(profile[0] - profile[1]),
+            })
+        for i in range(1, len(profile) - 1):
+            if profile[i] < threshold:
+                continue
+            if profile[i] < profile[i - 1] or profile[i] < profile[i + 1]:
+                continue
+            left_min = float(np.min(profile[max(0, i - min_distance):i + 1]))
+            right_min = float(np.min(profile[i:min(len(profile), i + min_distance + 1)]))
+            prominence = float(profile[i] - max(left_min, right_min))
+            if prominence >= min_prom:
+                candidates.append({
+                    "index": int(i),
+                    "value": float(profile[i]),
+                    "smoothed": float(smoothed[i]),
+                    "prominence": prominence,
+                })
+        last = len(profile) - 1
+        if last > 0 and profile[last] >= threshold and profile[last] >= profile[last - 1]:
+            candidates.append({
+                "index": int(last),
+                "value": float(profile[last]),
+                "smoothed": float(smoothed[last]),
+                "prominence": float(profile[last] - profile[last - 1]),
+            })
+
+        selected = []
+        for peak in sorted(candidates, key=lambda p: p["value"], reverse=True):
+            if all(abs(peak["index"] - old["index"]) >= min_distance for old in selected):
+                selected.append(peak)
+        selected.sort(key=lambda p: p["index"])
+        return selected, float(threshold), smoothed
+
+    def _mip_analysis(region, rect, target_mm):
+        y, x, rh, rw = rect
+        ul_h = max(3, int(np.ceil(0.64 * rh)))
+        ul_w = max(3, int(np.ceil(0.64 * rw)))
+        lr_y = max(0, int(np.floor(0.36 * rh)))
+        lr_x = max(0, int(np.floor(0.36 * rw)))
+        h_region = region[:ul_h, :ul_w]
+        v_region = region[lr_y:, lr_x:]
+
+        h_profile = np.max(h_region, axis=0)
+        v_profile = np.max(v_region, axis=1)
+        h_peaks, h_threshold, h_smooth = _detect_mip_peaks(h_profile, target_mm)
+        v_peaks, v_threshold, v_smooth = _detect_mip_peaks(v_profile, target_mm)
+
+        for peak in h_peaks:
+            peak["col"] = int(x + peak["index"])
+            peak["row"] = int(y + ul_h / 2)
+        for peak in v_peaks:
+            peak["col"] = int(x + lr_x + v_region.shape[1] / 2)
+            peak["row"] = int(y + lr_y + peak["index"])
+
+        return {
+            "target_mm": float(target_mm),
+            "rect": rect,
+            "horizontal_rect": [y, x, int(ul_h), int(ul_w)],
+            "vertical_rect": [y + int(lr_y), x + int(lr_x), int(v_region.shape[0]), int(v_region.shape[1])],
+            "horizontal": {
+                "x_mm": [round(float((i - (ul_w - 1) / 2) * px), 3) for i in range(ul_w)],
+                "values": [round(float(v), 3) for v in h_profile],
+                "smoothed": [round(float(v), 3) for v in h_smooth],
+                "threshold": round(h_threshold, 3),
+                "peaks": h_peaks,
+                "count": len(h_peaks),
+            },
+            "vertical": {
+                "x_mm": [round(float((i - (v_region.shape[0] - 1) / 2) * px), 3) for i in range(v_region.shape[0])],
+                "values": [round(float(v), 3) for v in v_profile],
+                "smoothed": [round(float(v), 3) for v in v_smooth],
+                "threshold": round(v_threshold, 3),
+                "peaks": v_peaks,
+                "count": len(v_peaks),
+            },
+        }
+
     # Misura modulazione per ogni griglia
     mod_1_1 = _measure_modulation(grid_regions[0])
     mod_1_0 = _measure_modulation(grid_regions[1])
     mod_0_9 = _measure_modulation(grid_regions[2])
+    targets_mm = [1.1, 1.0, 0.9]
+    mip_results = [
+        _mip_analysis(region, rect, target_mm)
+        for region, rect, target_mm in zip(grid_regions, grid_rects, targets_mm)
+    ]
 
     # Soglia di risoluzione: modulazione > 0.05 indica pattern risolto
     threshold = 0.05
-    resolved_1_1 = mod_1_1 > threshold
-    resolved_1_0 = mod_1_0 > threshold
-    resolved_0_9 = mod_0_9 > threshold
+    resolved_1_1 = mip_results[0]["horizontal"]["count"] >= 4 and mip_results[0]["vertical"]["count"] >= 4
+    resolved_1_0 = mip_results[1]["horizontal"]["count"] >= 4 and mip_results[1]["vertical"]["count"] >= 4
+    resolved_0_9 = mip_results[2]["horizontal"]["count"] >= 4 and mip_results[2]["vertical"]["count"] >= 4
 
     # Determina la risoluzione raggiunta
     if resolved_0_9:
@@ -1100,10 +1333,10 @@ def calculate_spatial_resolution(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
     elif resolved_1_1:
         resolved_mm = 1.1
     else:
-        resolved_mm = 999.0  # non risolto
+        resolved_mm = None
 
     # Limite: deve risolvere almeno 1.0 mm
-    passed = resolved_mm <= 1.0
+    passed = resolved_mm is not None and resolved_mm <= 1.0
 
     return {
         "resolved_mm": resolved_mm,
@@ -1118,6 +1351,9 @@ def calculate_spatial_resolution(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
         "center_rc": (cr, cc),
         "radius_px": r0,
         "grid_rects": grid_rects,
+        "resolution_mip": mip_results,
+        "analysis_mode": "assisted_mip_peaks",
+        "modulation_threshold": threshold,
     }
 
 
