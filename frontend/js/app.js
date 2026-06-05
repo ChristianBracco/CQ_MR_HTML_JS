@@ -472,8 +472,6 @@
       strokeText("Rampa ↓", bx + bw/2, by - 4, "#fb923c", "bold 9px sans-serif");
       // Show FWHM values
       if (r.top_ramp_length_mm !== undefined) {
-        strokeText(`FWHM=${r.top_ramp_length_mm.toFixed(1)}mm`, tx + tw/2, ty + th + 12, "#22d3ee", "9px monospace");
-        strokeText(`FWHM=${r.bottom_ramp_length_mm.toFixed(1)}mm`, bx + bw/2, by + bh + 12, "#fb923c", "9px monospace");
         labelBox(`Top ${r.top_ramp_length_mm.toFixed(1)} mm`, tx + tw/2, ty - 12, "#22d3ee", "bold 10px sans-serif");
         labelBox(`Bottom ${r.bottom_ramp_length_mm.toFixed(1)} mm`, bx + bw/2, by + bh + 14, "#fb923c", "bold 10px sans-serif");
       }

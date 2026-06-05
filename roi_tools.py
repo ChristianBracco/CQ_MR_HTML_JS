@@ -859,8 +859,54 @@ def calculate_slice_thickness(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
         ramp_h = max(2, int(round(3.0 / max(px, 1e-6))))
         ramp_w = max(24, int(round(78.0 / max(px, 1e-6))))
         ramp_w = min(ramp_w, max(24, int(round(0.85 * r0))))
-        offset = max(5, int(round(10.0 / max(px, 1e-6))))
         x0 = cc - ramp_w / 2
+
+        # The crossed ramps sit inside the dark horizontal slice-thickness
+        # insert. Find that insert first; fixed offsets easily land in the
+        # phantom fluid and inflate the measured lengths.
+        search_y0 = int(max(0, round(cr - 0.35 * r0)))
+        search_y1 = int(min(h, round(cr + 0.15 * r0)))
+        search_x0 = int(max(0, round(cc - 0.65 * r0)))
+        search_x1 = int(min(w, round(cc + 0.65 * r0)))
+        slot_y0 = slot_y1 = None
+        if search_y1 > search_y0 + 3 and search_x1 > search_x0 + 8:
+            band = arr[search_y0:search_y1, search_x0:search_x1].astype(np.float64)
+            row_means = np.mean(band, axis=1)
+            dark_cut = min(
+                float(np.percentile(row_means, 25)),
+                float(np.median(row_means) * 0.45),
+            )
+            dark = row_means <= dark_cut
+            runs = []
+            start = None
+            for i, is_dark in enumerate(dark):
+                if is_dark and start is None:
+                    start = i
+                elif not is_dark and start is not None:
+                    runs.append((start, i - 1))
+                    start = None
+            if start is not None:
+                runs.append((start, len(dark) - 1))
+            if runs:
+                target = len(dark) / 2.0
+                runs.sort(key=lambda run: (-(run[1] - run[0] + 1), abs(((run[0] + run[1]) / 2.0) - target)))
+                slot_y0 = search_y0 + runs[0][0]
+                slot_y1 = search_y0 + runs[0][1] + 1
+
+        if slot_y0 is not None and slot_y1 is not None and slot_y1 - slot_y0 >= 2 * ramp_h:
+            slot_h = slot_y1 - slot_y0
+            inset = max(1, int(round(0.18 * slot_h)))
+            top_y = slot_y0 + inset
+            bot_y = slot_y1 - ramp_h - inset
+            if bot_y <= top_y:
+                top_y = slot_y0
+                bot_y = slot_y1 - ramp_h
+            return (
+                _clamp_rect([top_y, x0, ramp_h, ramp_w]),
+                _clamp_rect([bot_y, x0, ramp_h, ramp_w]),
+            )
+
+        offset = max(3, int(round(4.0 / max(px, 1e-6))))
         return (
             _clamp_rect([cr - offset - ramp_h, x0, ramp_h, ramp_w]),
             _clamp_rect([cr + offset, x0, ramp_h, ramp_w]),
