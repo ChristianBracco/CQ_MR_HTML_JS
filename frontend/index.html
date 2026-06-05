@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MRI QC Analyzer — Phantom ACR</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+  <!-- HEADER -->
+  <header id="toolbar">
+    <div class="toolbar-left">
+      <span class="app-title">🧲 MRI QC Analyzer</span>
+      <span id="api-status" class="badge badge-warn">API…</span>
+    </div>
+
+    <nav class="toolbar-center" id="step-indicator">
+      <button class="step-btn active" data-step="1">
+        <span class="step-num">1</span> Carica
+      </button>
+      <span class="step-sep">›</span>
+      <button class="step-btn" data-step="2">
+        <span class="step-num">2</span> Slice
+      </button>
+      <span class="step-sep">›</span>
+      <button class="step-btn" data-step="3">
+        <span class="step-num">3</span> Info QC
+      </button>
+      <span class="step-sep">›</span>
+      <button class="step-btn" data-step="4">
+        <span class="step-num">4</span> Analisi
+      </button>
+      <span class="step-sep">›</span>
+      <button class="step-btn" data-step="5">
+        <span class="step-num">5</span> Report
+      </button>
+    </nav>
+
+    <div class="toolbar-right">
+      <button id="btn-theme-toggle" class="btn btn-xs" title="Toggle tema">🌙</button>
+    </div>
+  </header>
+
+  <!-- MAIN CONTENT -->
+  <main id="main-content">
+
+    <!-- STEP 1: Carica DICOM MRI -->
+    <section id="step-1" class="step-panel active">
+      <div class="welcome-card">
+        <h1>MRI QC Analyzer</h1>
+        <p class="subtitle">Controllo Qualità MRI con Phantom ACR</p>
+        <p class="subtitle" style="font-size:11px;color:var(--text-muted);margin-top:4px;">
+          Geometric · Resolution · Slice Thickness · Slice Position · PIU · PSG · LCD · SNR · SNRU
+        </p>
+
+        <div class="form-grid">
+          <label>Cartella DICOM (MRI)</label>
+          <div class="input-row">
+            <input type="text" id="input-dir" placeholder="Percorso cartella DICOM MRI" />
+          </div>
+        </div>
+
+        <button id="btn-load" class="btn btn-primary btn-large">
+          ▶ Carica Serie DICOM
+        </button>
+
+        <div id="load-progress" class="progress-area hidden">
+          <div class="spinner"></div>
+          <span id="load-msg">Caricamento in corso…</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- STEP 2: Selezione Slice -->
+    <section id="step-2" class="step-panel">
+      <div class="panel-header">
+        <h2>Selezione Slice → Moduli QC</h2>
+        <div class="panel-actions">
+          <button id="btn-auto-assign" class="btn btn-secondary">⚡ Auto-Assign</button>
+          <button id="btn-confirm-slices" class="btn btn-primary" disabled>Conferma ›</button>
+        </div>
+      </div>
+
+      <div id="module-legend" class="module-legend"></div>
+
+      <!-- Controls bar: WL/WW + Preset + Grid Size -->
+      <div class="controls-bar">
+        <div class="wlww-controls">
+          <label>WL <input type="number" id="wl-val" value="500" step="50" /></label>
+          <label>WW <input type="number" id="ww-val" value="1000" step="100" /></label>
+          <div class="preset-btns">
+            <button class="btn btn-xs preset-btn active" data-wl="500" data-ww="1000">MRI</button>
+            <button class="btn btn-xs preset-btn" data-wl="400" data-ww="600">Soft</button>
+            <button class="btn btn-xs preset-btn" data-wl="200" data-ww="400">Ghost</button>
+            <button class="btn btn-xs preset-btn" data-wl="0" data-ww="0">Auto</button>
+          </div>
+          <button id="btn-refresh-thumbs" class="btn btn-xs">↺ Aggiorna</button>
+        </div>
+        <div class="grid-size-btns">
+          <button class="btn btn-xs size-btn" data-size="S">S</button>
+          <button class="btn btn-xs size-btn active" data-size="M">M</button>
+          <button class="btn btn-xs size-btn" data-size="L">L</button>
+          <button class="btn btn-xs size-btn" data-size="XL">XL</button>
+        </div>
+      </div>
+
+      <p style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">
+        Seleziona un modulo QC, poi clicca sulla slice da assegnare. Più moduli possono condividere la stessa slice (es. PIU, PSG, SNR, SNRU → slice 7).
+      </p>
+
+      <div id="slice-grid" class="slice-grid"></div>
+    </section>
+
+    <!-- STEP 3: Info QC -->
+    <section id="step-3" class="step-panel">
+      <div class="panel-header">
+        <h2>📋 Informazioni Controllo QC</h2>
+        <button id="btn-start-analysis" class="btn btn-primary">Avvia Analisi ›</button>
+      </div>
+
+      <div class="info-form">
+        <div class="form-grid two-col">
+          <label>Data controllo</label>
+          <input type="date" id="info-date" />
+
+          <label>Tipo controllo</label>
+          <select id="info-type">
+            <option value="Costanza">Costanza</option>
+            <option value="Annuale">Annuale</option>
+            <option value="Accettazione">Accettazione</option>
+            <option value="Semestrale">Semestrale</option>
+            <option value="Stato">Stato</option>
+          </select>
+
+          <label>Presidio</label>
+          <input type="text" id="info-presidio" placeholder="es. Ospedale Mauriziano" />
+
+          <label>Sala / Scanner</label>
+          <input type="text" id="info-sala" placeholder="es. RM1" />
+
+          <label>Operatori</label>
+          <input type="text" id="info-operatori" placeholder="es. C. Bracco" />
+
+          <label>Note</label>
+          <textarea id="info-note" rows="3" placeholder="Note aggiuntive…"></textarea>
+        </div>
+
+        <div id="dicom-meta-card" class="meta-card"></div>
+      </div>
+    </section>
+
+    <!-- STEP 4: Analisi Interattiva -->
+    <section id="step-4" class="step-panel">
+      <div class="panel-header">
+        <h2 id="analysis-title">Analisi QC</h2>
+        <div class="panel-actions">
+          <button id="btn-analyze-all" class="btn btn-primary">⚡ Analizza Tutti</button>
+          <button id="btn-go-report" class="btn btn-secondary">Report ›</button>
+        </div>
+      </div>
+
+      <div id="module-tabs" class="tab-bar"></div>
+      <div id="module-content" class="module-content"></div>
+    </section>
+
+    <!-- STEP 5: Report -->
+    <section id="step-5" class="step-panel">
+      <div class="panel-header">
+        <h2>✅ Report QC MRI</h2>
+        <div class="panel-actions">
+          <button id="btn-new-analysis" class="btn btn-primary">↺ Nuova Analisi</button>
+        </div>
+      </div>
+
+      <div id="report-container" class="report-container"></div>
+    </section>
+
+  </main>
+
+  <!-- FOOTER -->
+  <footer id="status-bar">
+    <span id="status-msg">Pronto</span>
+    <span class="footer-credit">MRI QC — Phantom ACR</span>
+  </footer>
+
+  <!-- Scripts -->
+  <script src="js/api.js"></script>
+  <script src="js/state.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
