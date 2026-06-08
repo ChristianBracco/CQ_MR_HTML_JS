@@ -125,6 +125,7 @@
   // STEP 4: Interactive Analysis with editable ROIs, zoom, WW/WL, live update
   // ═══════════════════════════════════════════════════════════════════════════
   let _zoom = 1, _autoTimer = null;
+  const _activeResultView = {};
 
   function setupStep4() { buildAnalysisTabs(); const mods = AppState.moduleOrder.filter(m => m in AppState.assignments); if (mods.length > 0) showModule(mods[0]); }
 
@@ -156,6 +157,27 @@
           <label style="font-size:11px;">Indice seconda slice: <input type="number" id="snr-second-idx" value="${Math.min(idx+1, AppState.slices.length-1)}" min="0" max="${AppState.slices.length-1}" style="width:50px;font-size:11px;" /></label>
         </div>
       </div>` : "";
+    const piuControlsHtml = mod === "piu" ? `
+      <div style="margin-bottom:10px;padding:8px;background:var(--bg-surface);border-radius:var(--radius);border:1px solid var(--border);">
+        <label style="font-size:11px;font-weight:600;color:var(--accent-green);">Raggio ROI verde UFOV</label>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:4px;">
+          <input type="range" id="piu-ufov-fraction" min="0.55" max="0.85" step="0.01" value="0.80" style="flex:1;" />
+          <span id="lbl-piu-ufov" style="font-size:11px;font-weight:700;min-width:36px;">80%</span>
+        </div>
+      </div>` : "";
+    const lcdControlsHtml = mod === "low_contrast" ? `
+      <div style="margin-bottom:10px;padding:8px;background:var(--bg-surface);border-radius:var(--radius);border:1px solid var(--border);">
+        <label style="font-size:11px;font-weight:600;color:var(--accent-pink);">Rotazione spoke</label>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:4px;">
+          <input type="range" id="lcd-angle-offset" min="-18" max="18" step="0.5" value="0" style="flex:1;" />
+          <span id="lbl-lcd-angle" style="font-size:11px;font-weight:700;min-width:46px;">0°</span>
+        </div>
+        <label style="font-size:11px;font-weight:600;color:var(--accent-pink);display:block;margin-top:8px;">Raggio corona spoke</label>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:4px;">
+          <input type="range" id="lcd-ring-radius" min="25" max="55" step="0.5" value="40" style="flex:1;" />
+          <span id="lbl-lcd-radius" style="font-size:11px;font-weight:700;min-width:52px;">40 mm</span>
+        </div>
+      </div>` : "";
 
     content.innerHTML = `<div class="module-layout">
       <div class="module-image-panel">
@@ -171,6 +193,8 @@
         <div class="result-section">
           <h4>${AppState.moduleLabels[mod]}</h4>
           ${snrMethodHtml}
+          ${piuControlsHtml}
+          ${lcdControlsHtml}
           <p style="font-size:10px;color:var(--text-muted);margin-bottom:8px;">Tutte le ROI sono modificabili: <b>drag</b> per spostare, <b>dblclick</b> per aggiungere, <b>right-click</b> per rimuovere. L'analisi si aggiorna automaticamente.</p>
           <button class="btn btn-primary" id="btn-run">⚡ Analizza</button>
           <button class="btn btn-xs btn-secondary" id="btn-reset-roi" style="margin-left:6px;">↺ Reset ROI</button>
@@ -183,7 +207,7 @@
     if (AppState.results[mod]) {
       renderResults(mod, AppState.results[mod]);
       // Draw ROIs client-side on overlay
-      drawRoisOnOverlay(AppState.results[mod].results);
+      drawRoisOnOverlay(getActiveResult(mod));
       const runBtn = document.getElementById("btn-run");
       if (runBtn) {
         runBtn.textContent = "Fatto";
@@ -199,7 +223,40 @@
     // SNR method toggle
     if (mod === "snr") {
       const sel = document.getElementById("snr-method");
-      sel.addEventListener("change", () => { document.getElementById("snr-second-slice-wrap").classList.toggle("hidden", sel.value !== "two_image"); });
+      sel.addEventListener("change", () => {
+        document.getElementById("snr-second-slice-wrap").classList.toggle("hidden", sel.value !== "two_image");
+        const btn = document.getElementById("btn-run");
+        if (btn) {
+          btn.dataset.mode = "run";
+          btn.textContent = "Analizza";
+          btn.className = "btn btn-primary";
+        }
+        runAnalysis("snr");
+      });
+    }
+    if (mod === "piu") {
+      const piuSlider = document.getElementById("piu-ufov-fraction");
+      const piuLabel = document.getElementById("lbl-piu-ufov");
+      piuSlider?.addEventListener("input", () => {
+        if (piuLabel) piuLabel.textContent = `${Math.round(parseFloat(piuSlider.value) * 100)}%`;
+      });
+      piuSlider?.addEventListener("change", () => scheduleAutoAnalysis(mod));
+    }
+    if (mod === "low_contrast") {
+      const angle = document.getElementById("lcd-angle-offset");
+      const radius = document.getElementById("lcd-ring-radius");
+      const updateLcdLabels = () => {
+        const a = parseFloat(angle?.value || "0");
+        const rr = parseFloat(radius?.value || "40");
+        const la = document.getElementById("lbl-lcd-angle");
+        const lr = document.getElementById("lbl-lcd-radius");
+        if (la) la.textContent = `${a.toFixed(1)}°`;
+        if (lr) lr.textContent = `${rr.toFixed(1)} mm`;
+      };
+      angle?.addEventListener("input", updateLcdLabels);
+      radius?.addEventListener("input", updateLcdLabels);
+      angle?.addEventListener("change", () => scheduleAutoAnalysis(mod));
+      radius?.addEventListener("change", () => scheduleAutoAnalysis(mod));
     }
 
     document.getElementById("btn-run").addEventListener("click", () => {
@@ -213,13 +270,37 @@
       }
       runAnalysis(mod);
     });
-    document.getElementById("btn-reset-roi").addEventListener("click", () => { showModule(mod); });
+    document.getElementById("btn-reset-roi").addEventListener("click", async () => {
+      delete AppState.results[mod];
+      delete _activeResultView[mod];
+      const area = document.getElementById("mod-results-area");
+      if (area) area.innerHTML = "";
+      const overlay = document.getElementById("mod-overlay");
+      overlay?.getContext("2d")?.clearRect(0, 0, overlay.width, overlay.height);
+      const btn = document.getElementById("btn-run");
+      if (btn) {
+        btn.dataset.mode = "run";
+        btn.textContent = "Analizza";
+        btn.className = "btn btn-primary";
+        btn.disabled = false;
+      }
+      const idx0 = AppState.assignments[mod];
+      await loadBaseImage(idx0, 500, 1000);
+      runAnalysis(mod);
+    });
   }
 
   function bindWlWwZoom(idx) {
     let t = null;
     const wl = document.getElementById("mod-wl"), ww = document.getElementById("mod-ww"), zm = document.getElementById("mod-zoom");
-    const reload = () => { clearTimeout(t); t = setTimeout(() => loadBaseImage(idx, +wl.value, +ww.value), 200); };
+    const reload = () => {
+      clearTimeout(t);
+      t = setTimeout(() => {
+        const activeMod = document.querySelector(".tab-btn.active")?.dataset?.module;
+        const activeIdx = activeMod ? (getActiveResult(activeMod)?.slice_idx ?? idx) : idx;
+        loadBaseImage(activeIdx, +wl.value, +ww.value);
+      }, 200);
+    };
     wl.addEventListener("input", () => { document.getElementById("lbl-wl").textContent = wl.value; reload(); });
     ww.addEventListener("input", () => { document.getElementById("lbl-ww").textContent = ww.value; reload(); });
     zm.addEventListener("input", () => { _zoom = +zm.value; document.getElementById("lbl-zoom").textContent = `${_zoom}×`; applyZoom(); });
@@ -245,11 +326,41 @@
         // Redraw ROIs on overlay if we have results for the current module
         const activeMod = document.querySelector(".tab-btn.active")?.dataset?.module;
         if (activeMod && AppState.results[activeMod]) {
-          drawRoisOnOverlay(AppState.results[activeMod].results);
+          drawRoisOnOverlay(getActiveResult(activeMod));
         }
       };
       img.src = `data:image/png;base64,${r.image}`;
     } catch (e) {}
+  }
+
+  function getActiveResult(mod) {
+    return _activeResultView[mod] || AppState.results[mod]?.results || null;
+  }
+
+  async function showResultView(mod, result) {
+    if (!result) return;
+    _activeResultView[mod] = result;
+    updateLcdControlValues(result);
+    const wl = parseFloat(document.getElementById("mod-wl")?.value || "500");
+    const ww = parseFloat(document.getElementById("mod-ww")?.value || "1000");
+    const idx = Number.isInteger(result.slice_idx) ? result.slice_idx : AppState.assignments[mod];
+    await loadBaseImage(idx, wl, ww);
+    drawRoisOnOverlay(result);
+    document.querySelectorAll(".slice-view-btn").forEach(b => {
+      b.classList.toggle("active", b.dataset.idx === String(idx));
+    });
+  }
+
+  function updateLcdControlValues(result) {
+    const angle = document.getElementById("lcd-angle-offset");
+    const radius = document.getElementById("lcd-ring-radius");
+    if (!angle || !radius || !result) return;
+    if (result.lcd_angle_offset_deg !== undefined) angle.value = String(result.lcd_angle_offset_deg);
+    if (result.lcd_ring_radius_mm !== undefined) radius.value = String(result.lcd_ring_radius_mm);
+    const la = document.getElementById("lbl-lcd-angle");
+    const lr = document.getElementById("lbl-lcd-radius");
+    if (la) la.textContent = `${parseFloat(angle.value || "0").toFixed(1)}°`;
+    if (lr) lr.textContent = `${parseFloat(radius.value || "40").toFixed(1)} mm`;
   }
 
   // ── Elegant ROI drawing on overlay canvas ──────────────────────────────────
@@ -327,6 +438,48 @@
       ctx.strokeRect(x, y, w, h); ctx.setLineDash([]);
     }
 
+    function drawRampRoi(y, x, h, w, color) {
+      const x0 = x + 0.5;
+      const y0 = y + 0.5;
+      const x1 = x + w - 0.5;
+      const y1 = y + h - 0.5;
+      const tick = Math.min(9, Math.max(5, w * 0.08));
+      ctx.save();
+      ctx.globalAlpha = 0.08;
+      ctx.fillStyle = color;
+      ctx.fillRect(x, y, w, h);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = "rgba(15,23,42,0.85)";
+      ctx.lineWidth = 3;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(x0, y0); ctx.lineTo(x0 + tick, y0);
+      ctx.moveTo(x0, y0); ctx.lineTo(x0, y1);
+      ctx.moveTo(x1, y0); ctx.lineTo(x1 - tick, y0);
+      ctx.moveTo(x1, y0); ctx.lineTo(x1, y1);
+      ctx.moveTo(x0, y1); ctx.lineTo(x0 + tick, y1);
+      ctx.moveTo(x1, y1); ctx.lineTo(x1 - tick, y1);
+      ctx.stroke();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.15;
+      ctx.beginPath();
+      ctx.moveTo(x0, y0); ctx.lineTo(x0 + tick, y0);
+      ctx.moveTo(x0, y0); ctx.lineTo(x0, y1);
+      ctx.moveTo(x1, y0); ctx.lineTo(x1 - tick, y0);
+      ctx.moveTo(x1, y0); ctx.lineTo(x1, y1);
+      ctx.moveTo(x0, y1); ctx.lineTo(x0 + tick, y1);
+      ctx.moveTo(x1, y1); ctx.lineTo(x1 - tick, y1);
+      ctx.stroke();
+      ctx.fillStyle = color;
+      const cy = y + h / 2;
+      for (const hx of [x0, x1]) {
+        ctx.beginPath();
+        ctx.arc(hx, cy, 2.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
     // Helper: center cross
     function drawCross(cx, cy, size, color) {
       ctx.strokeStyle = color; ctx.lineWidth = 2;
@@ -361,7 +514,8 @@
         drawRect(ry, rx, rh, rw, color, 2);
         const cx = rx + rw / 2, cy = ry + rh / 2;
         strokeText(`${name[0].toUpperCase()}`, cx, cy - 6, color, "bold 11px sans-serif");
-        strokeText(`${roi.mean.toFixed(0)}`, cx, cy + 8, color, "9px monospace", "center", "top");
+        const roiVal = roi.mean !== undefined ? roi.mean : roi.std;
+        if (roiVal !== undefined) strokeText(`${Number(roiVal).toFixed(roi.std !== undefined && roi.mean === undefined ? 2 : 0)}`, cx, cy + 8, color, "9px monospace", "center", "top");
       }
     }
 
@@ -466,9 +620,9 @@
     if (r.top_ramp_rect && r.bot_ramp_rect) {
       const [ty, tx, th, tw] = r.top_ramp_rect;
       const [by, bx, bh, bw] = r.bot_ramp_rect;
-      drawRect(ty, tx, th, tw, "#22d3ee", 2, [4, 3]);
+      drawRampRoi(ty, tx, th, tw, "#22d3ee");
       strokeText("Rampa ↑", tx + tw/2, ty - 4, "#22d3ee", "bold 9px sans-serif");
-      drawRect(by, bx, bh, bw, "#fb923c", 2, [4, 3]);
+      drawRampRoi(by, bx, bh, bw, "#fb923c");
       strokeText("Rampa ↓", bx + bw/2, by - 4, "#fb923c", "bold 9px sans-serif");
       // Show FWHM values
       if (r.top_ramp_length_mm !== undefined) {
@@ -483,7 +637,7 @@
           const rr = prof.right_rc;
           if (!l || !rr) continue;
           ctx.strokeStyle = color;
-          ctx.lineWidth = 2.5;
+          ctx.lineWidth = 1.35;
           ctx.setLineDash([]);
           ctx.beginPath();
           ctx.moveTo(l[1], l[0]);
@@ -492,7 +646,7 @@
           ctx.fillStyle = "#ef4444";
           for (const p of [l, rr]) {
             ctx.beginPath();
-            ctx.arc(p[1], p[0], 3.2, 0, Math.PI * 2);
+            ctx.arc(p[1], p[0], 2.4, 0, Math.PI * 2);
             ctx.fill();
           }
         }
@@ -543,12 +697,22 @@
     if (r.n_visible !== undefined && r.n_total !== undefined) {
       const color = r.passed ? "#22c55e" : "#ef4444";
       strokeText(`${r.n_visible}/${r.n_total} visibili`, overlay.width/2, 14, color, "bold 12px sans-serif", "center", "top");
+      if (r.lcd_ring_radius_px !== undefined && r.center_rc) {
+        const ringPx = r.lcd_ring_radius_px;
+        dashedCircle(r.center_rc[1], r.center_rc[0], ringPx, "rgba(244,114,182,0.75)", 1.2, [3, 3]);
+      }
       // Draw spoke positions if available
       if (r.spokes && r.spokes.length > 0) {
         for (const spoke of r.spokes) {
-          if (spoke.center_rc) {
+          const spokeColor = spoke.visible ? "#22c55e" : (spoke.complete ? "#f59e0b" : "#ef444480");
+          if (spoke.disks && spoke.disks.length) {
+            for (const disk of spoke.disks) {
+              if (!disk.center_rc) continue;
+              const [dr, dc] = disk.center_rc;
+              solidCircle(dc, dr, disk.radius_px || 3, disk.visible ? spokeColor : "#ef444480", 1.25);
+            }
+          } else if (spoke.center_rc) {
             const [sr, sc] = spoke.center_rc;
-            const spokeColor = spoke.visible ? "#22c55e" : "#ef444480";
             solidCircle(sc, sr, 4, spokeColor);
           }
         }
@@ -558,8 +722,46 @@
     // ── Slice position: vertical profile lines ──
     if (r.bar_length_1_mm !== undefined && cr !== null) {
       const color = r.passed ? "#22c55e" : "#ef4444";
+      if (r.left_bar_rect && r.right_bar_rect) {
+        const [ly, lx, lh, lw] = r.left_bar_rect;
+        const [ry, rx, rh, rw] = r.right_bar_rect;
+        drawRampRoi(ly, lx, lh, lw, "#84cc16");
+        drawRampRoi(ry, rx, rh, rw, "#f59e0b");
+        labelBox(`L ${r.left_bar_length_mm?.toFixed(1) ?? r.bar_length_1_mm.toFixed(1)} mm`, lx + lw / 2, ly - 12, "#84cc16", "bold 10px sans-serif");
+        labelBox(`R ${r.right_bar_length_mm?.toFixed(1) ?? r.bar_length_2_mm.toFixed(1)} mm`, rx + rw / 2, ry - 12, "#f59e0b", "bold 10px sans-serif");
+      }
+      const posProfiles = r.slice_position_profiles;
+      if (posProfiles) {
+        for (const [key, prof] of Object.entries(posProfiles)) {
+          const p1 = prof.top_rc;
+          const p2 = prof.bottom_rc;
+          if (!p1 || !p2) continue;
+          const lineColor = key === "left" ? "#84cc16" : "#f59e0b";
+          ctx.strokeStyle = "rgba(15,23,42,0.9)";
+          ctx.lineWidth = 3;
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          ctx.moveTo(p1[1], p1[0]);
+          ctx.lineTo(p2[1], p2[0]);
+          ctx.stroke();
+          ctx.strokeStyle = lineColor;
+          ctx.lineWidth = 1.35;
+          ctx.beginPath();
+          ctx.moveTo(p1[1], p1[0]);
+          ctx.lineTo(p2[1], p2[0]);
+          ctx.stroke();
+          ctx.fillStyle = "#ef4444";
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = 1;
+          for (const p of [p1, p2]) {
+            ctx.beginPath();
+            ctx.arc(p[1], p[0], 2.6, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+          }
+        }
+      }
       strokeText(`Pos. err = ${r.slice_position_error_mm.toFixed(2)} mm`, overlay.width/2, 14, color, "bold 11px sans-serif", "center", "top");
-      strokeText(`Bar1=${r.bar_length_1_mm.toFixed(1)} Bar2=${r.bar_length_2_mm.toFixed(1)} mm`, overlay.width/2, 28, "#84cc16", "9px sans-serif", "center", "top");
     }
   }
 
@@ -633,7 +835,7 @@
   }
 
   function hitTestRoi(row, col, mod) {
-    const r = AppState.results[mod]?.results;
+    const r = getActiveResult(mod);
     if (!r) return null;
 
     // Test phantom center cross (drag to move all ROIs)
@@ -669,6 +871,20 @@
       const [by, bx, bh, bw] = r.bot_ramp_rect;
       if (row >= by && row <= by + bh && col >= bx && col <= bx + bw) {
         return { type: "bot_ramp_rect", rect: r.bot_ramp_rect };
+      }
+    }
+
+    // Test slice_position bar rects
+    if (r.left_bar_rect) {
+      const [ly, lx, lh, lw] = r.left_bar_rect;
+      if (row >= ly && row <= ly + lh && col >= lx && col <= lx + lw) {
+        return { type: "left_bar_rect", rect: r.left_bar_rect };
+      }
+    }
+    if (r.right_bar_rect) {
+      const [ry, rx, rh, rw] = r.right_bar_rect;
+      if (row >= ry && row <= ry + rh && col >= rx && col <= rx + rw) {
+        return { type: "right_bar_rect", rect: r.right_bar_rect };
       }
     }
 
@@ -717,7 +933,7 @@
     _dragState.startRow = row;
     _dragState.startCol = col;
 
-    const r = AppState.results[mod]?.results;
+    const r = getActiveResult(mod);
     if (!r) return;
 
     // Move the ROI based on type
@@ -738,6 +954,12 @@
     } else if (_dragState.type === "bot_ramp_rect" && r.bot_ramp_rect) {
       r.bot_ramp_rect[0] += dr;
       r.bot_ramp_rect[1] += dc;
+    } else if (_dragState.type === "left_bar_rect" && r.left_bar_rect) {
+      r.left_bar_rect[0] += dr;
+      r.left_bar_rect[1] += dc;
+    } else if (_dragState.type === "right_bar_rect" && r.right_bar_rect) {
+      r.right_bar_rect[0] += dr;
+      r.right_bar_rect[1] += dc;
     } else if (_dragState.type === "grid_rect" && r.grid_rects) {
       r.grid_rects[_dragState.index][0] += dr;
       r.grid_rects[_dragState.index][1] += dc;
@@ -760,7 +982,7 @@
     clearTimeout(_autoTimer);
     _autoTimer = setTimeout(() => {
       // Build kwargs from current ROI positions
-      const r = AppState.results[mod]?.results;
+    const r = getActiveResult(mod);
       let kwargs = null;
       if (r) {
         kwargs = {};
@@ -770,6 +992,33 @@
         // Slice thickness: pass ramp rects
         if (r.top_ramp_rect) kwargs.top_ramp_rect = r.top_ramp_rect;
         if (r.bot_ramp_rect) kwargs.bot_ramp_rect = r.bot_ramp_rect;
+        // Slice position: pass crossed-wedge bar rects
+        if (r.left_bar_rect) kwargs.left_bar_rect = r.left_bar_rect;
+        if (r.right_bar_rect) kwargs.right_bar_rect = r.right_bar_rect;
+        if (r.slice_idx !== undefined) kwargs.active_slice_idx = r.slice_idx;
+        const root = AppState.results[mod]?.results;
+        if (root?.slice_position_slices) {
+          kwargs.slice_position_overrides = {};
+          for (const sr of root.slice_position_slices) {
+            kwargs.slice_position_overrides[sr.slice_idx] = {
+              left_bar_rect: sr.left_bar_rect,
+              right_bar_rect: sr.right_bar_rect,
+              center_rc: sr.center_rc,
+              radius_px: sr.radius_px,
+            };
+          }
+        }
+        if (root?.lcd_slices) {
+          kwargs.lcd_overrides = {};
+          for (const sr of root.lcd_slices) {
+            kwargs.lcd_overrides[sr.slice_idx] = {
+              center_rc: sr.center_rc,
+              radius_px: sr.radius_px,
+              lcd_angle_offset_deg: sr.lcd_angle_offset_deg,
+              lcd_ring_radius_mm: sr.lcd_ring_radius_mm,
+            };
+          }
+        }
         // Resolution: pass grid rects
         if (r.grid_rects) kwargs.grid_rects = r.grid_rects;
         // Common: center and radius
@@ -787,6 +1036,18 @@
           if (!isNaN(idx2) && idx2 >= 0) kwargs.second_slice_idx = idx2;
         }
       }
+      if (mod === "piu") {
+        const frac = parseFloat(document.getElementById("piu-ufov-fraction")?.value || "0.8");
+        kwargs = kwargs || {};
+        if (!isNaN(frac)) kwargs.ufov_fraction = frac;
+      }
+      if (mod === "low_contrast") {
+        const angle = parseFloat(document.getElementById("lcd-angle-offset")?.value || "0");
+        const radius = parseFloat(document.getElementById("lcd-ring-radius")?.value || "40");
+        kwargs = kwargs || {};
+        if (!isNaN(angle)) kwargs.lcd_angle_offset_deg = angle;
+        if (!isNaN(radius)) kwargs.lcd_ring_radius_mm = radius;
+      }
       runAnalysis(mod, kwargs);
     }, 600);
   }
@@ -797,6 +1058,7 @@
     if (btn) { btn.disabled = true; btn.textContent = "⏳…"; }
     UI.setStatus(`Analisi ${AppState.moduleLabels[mod]}…`);
     try {
+      const activeIdxBefore = getActiveResult(mod)?.slice_idx;
       let kwargs = extraKwargs;
       // SNR: pass method and optional second slice (if not already in extraKwargs)
       if (mod === "snr" && (!kwargs || !kwargs.snr_method)) {
@@ -808,11 +1070,29 @@
           if (!isNaN(idx2) && idx2 >= 0) kwargs.second_slice_idx = idx2;
         }
       }
+      if (mod === "piu") {
+        const frac = parseFloat(document.getElementById("piu-ufov-fraction")?.value || "0.8");
+        kwargs = kwargs || {};
+        if (!isNaN(frac)) kwargs.ufov_fraction = frac;
+      }
+      if (mod === "low_contrast") {
+        const angle = parseFloat(document.getElementById("lcd-angle-offset")?.value || "0");
+        const radius = parseFloat(document.getElementById("lcd-ring-radius")?.value || "40");
+        kwargs = kwargs || {};
+        if (!isNaN(angle)) kwargs.lcd_angle_offset_deg = angle;
+        if (!isNaN(radius)) kwargs.lcd_ring_radius_mm = radius;
+      }
       const resp = await API.analyzeModule(mod, kwargs);
       AppState.results[mod] = resp;
       renderResults(mod, resp);
-      // Draw ROIs client-side on overlay (NOT the server PNG)
-      drawRoisOnOverlay(resp.results);
+      const views = resp.results?.slice_position_slices || resp.results?.lcd_slices || [];
+      const activeAfter = views.find(x => x.slice_idx === activeIdxBefore) || resp.results;
+      _activeResultView[mod] = activeAfter;
+      if (activeAfter?.slice_idx !== undefined && activeAfter.slice_idx !== resp.slice_info?.idx) {
+        await showResultView(mod, activeAfter);
+      } else {
+        drawRoisOnOverlay(activeAfter);
+      }
       const passed = resp.results?.passed;
       const ts = document.getElementById(`ts-${mod}`);
       if (ts) ts.className = `tab-status ${passed === false ? "fail" : "pass"}`;
@@ -849,6 +1129,8 @@
       html = `<div class="result-section">
         <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">PIU</span><span class="summary-value">${UI.fmt(r.piu_percent,2)}%</span></div>
         <div class="summary-row info"><span class="summary-label">S_max / S_min</span><span class="summary-value">${UI.fmt(r.s_max,1)} / ${UI.fmt(r.s_min,1)}</span></div>
+        <div class="summary-row info"><span class="summary-label">Raggio UFOV</span><span class="summary-value">${Math.round((r.ufov_fraction||0.8)*100)}% (${r.ufov_radius_px||"-"} px)</span></div>
+        <div class="summary-row info"><span class="summary-label">Ricerca max/min</span><span class="summary-value">interna alla ROI verde</span></div>
         <div class="summary-row info"><span class="summary-label">Limite</span><span class="summary-value">≥ ${r.limit||87.5}%</span></div>
       </div>`;
     } else if (mod === "snr") {
@@ -920,9 +1202,22 @@
       }
     } else if (mod === "slice_position") {
       html = `<div class="result-section">
-        <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">Errore posizione</span><span class="summary-value">${UI.fmt(r.slice_position_error_mm,2)} mm</span></div>
-        <div class="summary-row info"><span class="summary-label">Barra 1 / 2</span><span class="summary-value">${UI.fmt(r.bar_length_1_mm,2)} / ${UI.fmt(r.bar_length_2_mm,2)} mm</span></div>
+        <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">Errore max |slice 1/11|</span><span class="summary-value">${UI.fmt(r.slice_position_max_abs_error_mm ?? Math.abs(r.slice_position_error_mm),2)} mm</span></div>
+        <div class="summary-row info"><span class="summary-label">Barra sinistra / destra</span><span class="summary-value">${UI.fmt(r.left_bar_length_mm ?? r.bar_length_1_mm,2)} / ${UI.fmt(r.right_bar_length_mm ?? r.bar_length_2_mm,2)} mm</span></div>
+        <div class="summary-row info"><span class="summary-label">Segno ACR</span><span class="summary-value">destra - sinistra</span></div>
+        <div class="summary-row info"><span class="summary-label">Soglia barre</span><span class="summary-value">${UI.fmt(r.bar_threshold,1)}</span></div>
       </div>`;
+      if (r.slice_position_slices) {
+        html += `<div class="result-section"><h4>Slice 1 e 11</h4><div style="display:flex;gap:6px;margin-bottom:8px;">`;
+        for (const sr of r.slice_position_slices) {
+          html += `<button class="btn btn-xs btn-secondary slice-view-btn" data-module="slice_position" data-idx="${sr.slice_idx}">Slice ${sr.slice_number_acr}</button>`;
+        }
+        html += `</div><table class="result-table"><thead><tr><th>Slice</th><th>Sinistra</th><th>Destra</th><th>Errore</th><th>Esito</th></tr></thead><tbody>`;
+        for (const sr of r.slice_position_slices) {
+          html += `<tr><td>${sr.slice_number_acr}</td><td>${UI.fmt(sr.left_bar_length_mm,2)}</td><td>${UI.fmt(sr.right_bar_length_mm,2)}</td><td style="font-weight:700">${UI.fmt(sr.slice_position_error_mm,2)} mm</td><td>${UI.passIcon(sr.passed)}</td></tr>`;
+        }
+        html += `</tbody></table></div>`;
+      }
     } else if (mod === "resolution") {
       html = `<div class="result-section">
         <div class="summary-row info"><span class="summary-label">Modalita</span><span class="summary-value">assistita MIP + picchi</span></div>
@@ -971,12 +1266,44 @@
       }
     } else if (mod === "low_contrast") {
       html = `<div class="result-section">
-        <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">Spoke visibili</span><span class="summary-value">${r.n_visible||0} / ${r.n_total||"?"}</span></div>
+        <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">LCD totale slice 8-11</span><span class="summary-value">${r.lcd_total_visible ?? r.n_visible ?? 0} / ${r.lcd_total_possible ?? r.n_total ?? "?"}</span></div>
+        <div class="summary-row info"><span class="summary-label">Geometria spoke</span><span class="summary-value">${UI.fmt(r.lcd_ring_radius_mm,1)} mm, ${UI.fmt(r.lcd_angle_offset_deg,1)}°</span></div>
+        <div class="summary-row info"><span class="summary-label">Ancora automatica</span><span class="summary-value">slice ${r.lcd_anchor_slice ?? 11}: ${UI.fmt(r.lcd_anchor_ring_radius_mm,1)} mm, ${UI.fmt(r.lcd_anchor_angle_offset_deg,1)}°</span></div>
+        <div class="summary-row info"><span class="summary-label">Soglia auto CNR</span><span class="summary-value">${UI.fmt(r.lcd_visibility_cnr_threshold,2)}</span></div>
+        <div class="summary-row ${r.passed_t1?'pass':'fail'}"><span class="summary-label">Limite ACR T1</span><span class="summary-value">${r.lcd_limit_t1 ?? "-"} spoke</span></div>
+        <div class="summary-row ${r.passed_t2?'pass':'fail'}"><span class="summary-label">Limite ACR T2</span><span class="summary-value">${r.lcd_limit_t2 ?? "-"} spoke</span></div>
       </div>`;
+      if (r.lcd_slices) {
+        html += `<div class="result-section"><h4>Conteggio per slice</h4><div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;">`;
+        for (const sr of r.lcd_slices) {
+          html += `<button class="btn btn-xs btn-secondary slice-view-btn" data-module="low_contrast" data-idx="${sr.slice_idx}">Slice ${sr.slice_number_acr}</button>`;
+        }
+        html += `</div><table class="result-table"><thead><tr><th>Slice</th><th>Contrasto</th><th>Spoke</th><th>Oggetti</th></tr></thead><tbody>`;
+        const contrasts = {8:"1.4%",9:"2.5%",10:"3.6%",11:"5.1%"};
+        for (const sr of r.lcd_slices) {
+          html += `<tr><td>${sr.slice_number_acr}</td><td>${contrasts[sr.slice_number_acr] || "-"}</td><td style="font-weight:700">${sr.n_visible}/${sr.n_total}</td><td>${(sr.spokes||[]).filter(s => s.visible).length}</td></tr>`;
+        }
+        html += `</tbody></table></div>`;
+      }
     } else {
       html = `<div class="result-section"><pre style="font-size:10px;overflow:auto;max-height:200px;">${JSON.stringify(r,null,2)}</pre></div>`;
     }
     area.innerHTML = html;
+    if (mod === "piu") {
+      const slider = document.getElementById("piu-ufov-fraction");
+      const label = document.getElementById("lbl-piu-ufov");
+      if (slider && r.ufov_fraction) slider.value = String(r.ufov_fraction);
+      if (label) label.textContent = `${Math.round((r.ufov_fraction || 0.8) * 100)}%`;
+    }
+    if (mod === "low_contrast") updateLcdControlValues(getActiveResult(mod) || r);
+    for (const btn of area.querySelectorAll(".slice-view-btn")) {
+      btn.addEventListener("click", () => {
+        const root = AppState.results[mod]?.results;
+        const list = root?.slice_position_slices || root?.lcd_slices || [];
+        const target = list.find(x => String(x.slice_idx) === btn.dataset.idx);
+        showResultView(mod, target || root);
+      });
+    }
     if (mod === "resolution") {
       for (const input of area.querySelectorAll(".resolution-manual-tick")) {
         input.addEventListener("change", () => {

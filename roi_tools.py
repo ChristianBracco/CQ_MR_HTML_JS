@@ -213,7 +213,9 @@ def calculate_psg(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
 # ==============================================================================
 
 def calculate_piu(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
-                  center_rc=None, radius_px=None):
+                  center_rc=None, radius_px=None,
+                  ufov_fraction: float = 0.8,
+                  ufov_radius_px=None):
     """
     Calcola la Percent Image Uniformity (PIU) secondo ACR.
 
@@ -258,13 +260,19 @@ def calculate_piu(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
     i1 = convolve(arr.astype(np.float64), mask, mode='constant', cval=0.0) / n_mask
 
     # UFOV: cerchio con R = 0.8 × R0
-    r_ufov = int(0.8 * r0)
+    if ufov_radius_px is not None:
+        r_ufov = int(round(float(ufov_radius_px)))
+    else:
+        ufov_fraction = max(0.45, min(0.9, float(ufov_fraction)))
+        r_ufov = int(round(ufov_fraction * r0))
     Y, X = np.ogrid[:h, :w]
     ufov_mask = ((X - cc)**2 + (Y - cr)**2) <= r_ufov**2
+    search_radius = max(1, r_ufov - r_mask_px)
+    search_mask = ((X - cc)**2 + (Y - cr)**2) <= search_radius**2
 
     # Trova max e min dentro UFOV
     i1_ufov = i1.copy()
-    i1_ufov[~ufov_mask] = np.nan
+    i1_ufov[~search_mask] = np.nan
 
     s_max = float(np.nanmax(i1_ufov))
     s_min = float(np.nanmin(i1_ufov))
@@ -295,6 +303,8 @@ def calculate_piu(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
         "center_rc": (cr, cc),
         "radius_px": r0,
         "ufov_radius_px": r_ufov,
+        "ufov_fraction": round(float(r_ufov / max(float(r0), 1e-6)), 3),
+        "piu_search_radius_px": search_radius,
         "mask_radius_px": r_mask_px,
     }
 
@@ -346,9 +356,11 @@ def calculate_snr_single_image(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
     gap_px = int(0.1 * r0)
     target_area_mm2 = 1000.0
 
-    def _bg_roi_std(arr, y0, x0, roi_h, roi_w):
+    def _bg_roi_stats(arr, y0, x0, roi_h, roi_w):
         roi = arr[y0:y0 + roi_h, x0:x0 + roi_w]
-        return float(np.std(roi)) if roi.size > 0 else 1.0
+        if roi.size > 0:
+            return float(np.std(roi)), float(np.mean(roi))
+        return 1.0, 0.0
 
     # Right
     x_start_R = cc + r0 + gap_px
@@ -356,7 +368,7 @@ def calculate_snr_single_image(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
     h_R = max(3, int(target_area_mm2 / (w_R * px * py)))
     h_R = min(h_R, h - 2)
     y_start_R = max(0, cr - h_R // 2)
-    std_R = _bg_roi_std(arr, y_start_R, x_start_R, h_R, w_R)
+    std_R, mean_R = _bg_roi_stats(arr, y_start_R, x_start_R, h_R, w_R)
 
     # Left
     x_start_L = gap_px
@@ -364,7 +376,7 @@ def calculate_snr_single_image(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
     h_L = max(3, int(target_area_mm2 / (w_L * px * py)))
     h_L = min(h_L, h - 2)
     y_start_L = max(0, cr - h_L // 2)
-    std_L = _bg_roi_std(arr, y_start_L, x_start_L, h_L, w_L)
+    std_L, mean_L = _bg_roi_stats(arr, y_start_L, x_start_L, h_L, w_L)
 
     # Up
     y_start_U = gap_px
@@ -372,7 +384,7 @@ def calculate_snr_single_image(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
     h_U_w = max(3, int(target_area_mm2 / (w_U_h * px * py)))
     h_U_w = min(h_U_w, w - 2)
     x_start_U = max(0, cc - h_U_w // 2)
-    std_U = _bg_roi_std(arr, y_start_U, x_start_U, w_U_h, h_U_w)
+    std_U, mean_U = _bg_roi_stats(arr, y_start_U, x_start_U, w_U_h, h_U_w)
 
     # Down
     y_start_D = cr + r0 + gap_px
@@ -380,7 +392,7 @@ def calculate_snr_single_image(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
     h_D_w = max(3, int(target_area_mm2 / (w_D_h * px * py)))
     h_D_w = min(h_D_w, w - 2)
     x_start_D = max(0, cc - h_D_w // 2)
-    std_D = _bg_roi_std(arr, y_start_D, x_start_D, w_D_h, h_D_w)
+    std_D, mean_D = _bg_roi_stats(arr, y_start_D, x_start_D, w_D_h, h_D_w)
 
     # SNR con diverse combinazioni di background — Eq. (7)
     snr_lr = 2.0 * 0.665 * signal_mean / max(std_L + std_R, 1e-6)
@@ -402,6 +414,13 @@ def calculate_snr_single_image(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
         "std_down": round(std_D, 4),
         "center_rc": (cr, cc),
         "radius_px": r0,
+        "ufov_radius_px": r_ufov,
+        "rois": {
+            "right": {"rect": [int(y_start_R), int(x_start_R), int(h_R), int(w_R)], "std": round(std_R, 4), "mean": round(mean_R, 2)},
+            "left": {"rect": [int(y_start_L), int(x_start_L), int(h_L), int(w_L)], "std": round(std_L, 4), "mean": round(mean_L, 2)},
+            "up": {"rect": [int(y_start_U), int(x_start_U), int(w_U_h), int(h_U_w)], "std": round(std_U, 4), "mean": round(mean_U, 2)},
+            "down": {"rect": [int(y_start_D), int(x_start_D), int(w_D_h), int(h_D_w)], "std": round(std_D, 4), "mean": round(mean_D, 2)},
+        },
         "passed": True,  # SNR non ha un limite fisso ACR, dipende dal campo
     }
 
@@ -1408,7 +1427,9 @@ def calculate_spatial_resolution(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
 # ==============================================================================
 
 def calculate_low_contrast(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
-                           center_rc=None, radius_px=None):
+                           center_rc=None, radius_px=None,
+                           lcd_angle_offset_deg: float = 0.0,
+                           lcd_ring_radius_mm: float = 40.0):
     """
     Valuta la rilevabilità degli oggetti a basso contrasto nelle slice #8-#11
     del phantom ACR.
@@ -1539,6 +1560,354 @@ def calculate_low_contrast(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
         "passed": passed,
         "spoke_radius_mm": spoke_radius_mm,
         "disk_radius_mm": disk_radius_mm,
+        "center_rc": (cr, cc),
+        "radius_px": r0,
+    }
+
+
+# Override legacy slice-position implementation above with the ACR bar-length
+# method. Keeping this at EOF avoids touching older text with broken encoding.
+def calculate_slice_position(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
+                             center_rc=None, radius_px=None,
+                             left_bar_rect=None, right_bar_rect=None):
+    """
+    ACR slice position accuracy from the two dark vertical crossed-wedge bars.
+    The reported value is right length minus left length, so it is negative
+    when the left bar is longer, matching the ACR sign convention.
+    """
+    h, w = arr.shape
+    px = float(pixel_spacing_mm)
+
+    if center_rc is None or radius_px is None:
+        cr, cc, r0 = find_phantom_circle(arr, pixel_spacing_mm)
+    else:
+        cr, cc = center_rc
+        r0 = radius_px
+
+    cr = int(np.clip(round(cr), 0, h - 1))
+    cc = int(np.clip(round(cc), 0, w - 1))
+    r0 = float(r0)
+
+    def _clamp_rect(rect):
+        y, x, rh, rw = [int(round(v)) for v in rect]
+        y = max(0, min(h - 1, y))
+        x = max(0, min(w - 1, x))
+        rh = max(1, min(h - y, rh))
+        rw = max(1, min(w - x, rw))
+        return [y, x, rh, rw]
+
+    def _components(mask):
+        mh, mw = mask.shape
+        seen = np.zeros_like(mask, dtype=bool)
+        comps = []
+        for rr in range(mh):
+            for cc0 in range(mw):
+                if not mask[rr, cc0] or seen[rr, cc0]:
+                    continue
+                stack = [(rr, cc0)]
+                seen[rr, cc0] = True
+                pts = []
+                while stack:
+                    pr, pc = stack.pop()
+                    pts.append((pr, pc))
+                    for nr, nc in ((pr - 1, pc), (pr + 1, pc), (pr, pc - 1), (pr, pc + 1)):
+                        if 0 <= nr < mh and 0 <= nc < mw and mask[nr, nc] and not seen[nr, nc]:
+                            seen[nr, nc] = True
+                            stack.append((nr, nc))
+                rows = [p[0] for p in pts]
+                cols = [p[1] for p in pts]
+                comps.append({
+                    "r0": min(rows), "r1": max(rows) + 1,
+                    "c0": min(cols), "c1": max(cols) + 1,
+                    "area": len(pts),
+                })
+        return comps
+
+    def _fallback_rects():
+        bar_w = max(4, int(round(8.0 / max(px, 1e-6))))
+        bar_h = max(12, int(round(28.0 / max(px, 1e-6))))
+        y = int(round(cr - 0.86 * r0))
+        return (
+            _clamp_rect([y, cc - bar_w - 1, bar_h, bar_w]),
+            _clamp_rect([y, cc + 1, bar_h, bar_w]),
+        )
+
+    def _default_rects():
+        search_y0 = int(max(0, round(cr - 0.98 * r0)))
+        search_y1 = int(min(h, round(cr - 0.20 * r0)))
+        search_x0 = int(max(0, round(cc - 0.26 * r0)))
+        search_x1 = int(min(w, round(cc + 0.30 * r0)))
+        pad_y = max(2, int(round(2.0 / max(px, 1e-6))))
+        pad_x = max(2, int(round(2.0 / max(px, 1e-6))))
+
+        if search_y1 <= search_y0 + 8 or search_x1 <= search_x0 + 8:
+            return _fallback_rects()
+
+        patch = arr[search_y0:search_y1, search_x0:search_x1].astype(np.float64)
+        yy, xx = np.ogrid[search_y0:search_y1, search_x0:search_x1]
+        circle_mask = (yy - cr) ** 2 + (xx - cc) ** 2 <= (0.98 * r0) ** 2
+        valid = patch[circle_mask]
+        if valid.size < 20:
+            valid = patch.reshape(-1)
+        dark_cut = float(np.percentile(valid, 8))
+        dark = (patch <= dark_cut) & circle_mask
+
+        comps = []
+        for comp in _components(dark):
+            ch = comp["r1"] - comp["r0"]
+            cw = comp["c1"] - comp["c0"]
+            min_h = max(8, int(round(8.0 / max(px, 1e-6))))
+            if comp["area"] < 8 or ch < min_h or cw < 2 or ch < 1.5 * cw:
+                continue
+            comp["cy"] = (comp["r0"] + comp["r1"]) / 2.0 + search_y0
+            comp["cx"] = (comp["c0"] + comp["c1"]) / 2.0 + search_x0
+            comp["score"] = comp["area"] + 2.0 * ch - abs(comp["cx"] - cc) * 0.15
+            comps.append(comp)
+
+        if len(comps) < 2:
+            return _fallback_rects()
+
+        comps.sort(key=lambda c: c["score"], reverse=True)
+        best_pair = None
+        best_score = -1e9
+        for i in range(min(len(comps), 8)):
+            for j in range(i + 1, min(len(comps), 8)):
+                a, b = comps[i], comps[j]
+                sep = abs(a["cx"] - b["cx"])
+                if sep < max(3, int(round(2.0 / max(px, 1e-6)))) or sep > max(30, int(round(30.0 / max(px, 1e-6)))):
+                    continue
+                y_overlap = min(a["r1"], b["r1"]) - max(a["r0"], b["r0"])
+                y_align = abs(a["cy"] - b["cy"])
+                score = a["score"] + b["score"] + y_overlap - y_align
+                if score > best_score:
+                    best_score = score
+                    best_pair = (a, b)
+
+        if best_pair is None:
+            comps.sort(key=lambda c: abs(c["cx"] - cc))
+            best_pair = (comps[0], comps[1])
+
+        left, right = sorted(best_pair, key=lambda c: c["cx"])
+
+        def _rect_from_comp(comp):
+            return _clamp_rect([
+                search_y0 + comp["r0"] - pad_y,
+                search_x0 + comp["c0"] - pad_x,
+                (comp["r1"] - comp["r0"]) + 2 * pad_y,
+                (comp["c1"] - comp["c0"]) + 2 * pad_x,
+            ])
+
+        return _rect_from_comp(left), _rect_from_comp(right)
+
+    default_left, default_right = _default_rects()
+    left_bar_rect = _clamp_rect(left_bar_rect) if left_bar_rect else default_left
+    right_bar_rect = _clamp_rect(right_bar_rect) if right_bar_rect else default_right
+
+    def _measure_dark_bar(rect):
+        y, x, rh, rw = rect
+        roi = arr[y:y + rh, x:x + rw].astype(np.float64)
+        if roi.size == 0:
+            return 0.0, None, None, np.array([], dtype=float), 0.0, 0.0
+        profile = np.mean(roi, axis=1)
+        water = float(np.percentile(profile, 90))
+        bar = float(np.percentile(profile, 10))
+        threshold = bar + 0.5 * (water - bar)
+        dark_rows = np.where(profile <= threshold)[0]
+        if len(dark_rows) < 2:
+            return 0.0, None, None, profile, threshold, float(np.mean(roi))
+
+        def _cross(edge_idx, neighbor_idx):
+            y0, y1 = float(neighbor_idx), float(edge_idx)
+            v0, v1 = float(profile[neighbor_idx]), float(profile[edge_idx])
+            if abs(v1 - v0) < 1e-9:
+                return y1
+            return y0 + (threshold - v0) * (y1 - y0) / (v1 - v0)
+
+        top_i = int(dark_rows[0])
+        bot_i = int(dark_rows[-1])
+        top = _cross(top_i, top_i - 1) if top_i > 0 else float(top_i)
+        bot = _cross(bot_i, bot_i + 1) if bot_i < len(profile) - 1 else float(bot_i)
+        if bot <= top:
+            top, bot = float(top_i), float(bot_i)
+        return float((bot - top) * px), float(top), float(bot), profile, threshold, float(np.mean(roi))
+
+    left_len_mm, left_top, left_bottom, left_profile, left_threshold, left_mean = _measure_dark_bar(left_bar_rect)
+    right_len_mm, right_top, right_bottom, right_profile, right_threshold, right_mean = _measure_dark_bar(right_bar_rect)
+    slice_position_error_mm = right_len_mm - left_len_mm
+
+    limit_mm = 5.0
+    limit_recommended_mm = 4.0
+    passed = abs(slice_position_error_mm) <= limit_mm
+    passed_recommended = abs(slice_position_error_mm) <= limit_recommended_mm
+
+    def _pack_profile(rect, profile, top, bottom, threshold, length_mm):
+        y, x, rh, rw = rect
+        return {
+            "rect": rect,
+            "profile": [round(float(v), 3) for v in profile.tolist()],
+            "threshold": round(float(threshold), 3),
+            "top_rc": [y + top, x + rw / 2.0] if top is not None else None,
+            "bottom_rc": [y + bottom, x + rw / 2.0] if bottom is not None else None,
+            "length_mm": round(float(length_mm), 2),
+        }
+
+    return {
+        "slice_position_error_mm": round(slice_position_error_mm, 2),
+        "bar_length_1_mm": round(left_len_mm, 2),
+        "bar_length_2_mm": round(right_len_mm, 2),
+        "left_bar_length_mm": round(left_len_mm, 2),
+        "right_bar_length_mm": round(right_len_mm, 2),
+        "left_bar_rect": left_bar_rect,
+        "right_bar_rect": right_bar_rect,
+        "slice_position_sign_rule": "right - left; negative if left bar is longer",
+        "bar_signal_mean": round(float((left_mean + right_mean) / 2.0), 3),
+        "bar_threshold": round(float((left_threshold + right_threshold) / 2.0), 3),
+        "slice_position_profiles": {
+            "left": _pack_profile(left_bar_rect, left_profile, left_top, left_bottom, left_threshold, left_len_mm),
+            "right": _pack_profile(right_bar_rect, right_profile, right_top, right_bottom, right_threshold, right_len_mm),
+        },
+        "passed": passed,
+        "passed_recommended": passed_recommended,
+        "limit_mm": limit_mm,
+        "limit_recommended_mm": limit_recommended_mm,
+        "center_rc": (cr, cc),
+        "radius_px": r0,
+    }
+
+
+# Override legacy LCD implementation with ACR-style complete-spoke scoring.
+def calculate_low_contrast(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
+                           center_rc=None, radius_px=None,
+                           lcd_angle_offset_deg: float = 0.0,
+                           lcd_ring_radius_mm: float = 40.0):
+    h, w = arr.shape
+    px = float(pixel_spacing_mm)
+    if center_rc is None or radius_px is None:
+        cr, cc, r0 = find_phantom_circle(arr, pixel_spacing_mm)
+    else:
+        cr, cc = center_rc
+        r0 = radius_px
+
+    cr = int(round(cr))
+    cc = int(round(cc))
+    Y, X = np.ogrid[:h, :w]
+    if center_rc is None:
+        search = ((X - cc) ** 2 + (Y - cr) ** 2) <= (0.75 * float(r0)) ** 2
+        vals = arr[search & (arr > 0)]
+        if vals.size > 50:
+            dark_cut = float(np.percentile(vals, 8))
+            ring_mask = search & (arr <= dark_cut)
+            rr, cc_idx = np.where(ring_mask)
+            if rr.size > 30:
+                cr = int(round(float(np.mean(rr))))
+                cc = int(round(float(np.mean(cc_idx))))
+    dist_from_center = np.sqrt((X - cc) ** 2 + (Y - cr) ** 2)
+
+    bg_mask = (dist_from_center >= int(round(62.0 / px))) & (dist_from_center <= int(round(72.0 / px)))
+    bg_mask &= ((X - cc) ** 2 + (Y - cr) ** 2) <= (0.9 * float(r0)) ** 2
+    bg_values = arr[bg_mask & (arr > 0)]
+    if bg_values.size < 50:
+        inner = int(round(24.0 / px))
+        outer = int(round(70.0 / px))
+        bg_mask = (dist_from_center >= inner) & (dist_from_center <= outer)
+        bg_values = arr[bg_mask & (arr > 0)]
+    bg_mean = float(np.mean(bg_values)) if bg_values.size else float(np.mean(arr[arr > 0]))
+    bg_std = float(np.std(bg_values)) if bg_values.size else float(np.std(arr[arr > 0]))
+
+    n_spokes = 10
+    spoke_disk_diameters_mm = [7.0, 6.0, 5.0, 4.0, 3.5, 3.0, 2.5, 2.0, 1.75, 1.5]
+    lcd_angle_offset_deg = float(lcd_angle_offset_deg)
+    lcd_ring_radius_mm = max(20.0, min(60.0, float(lcd_ring_radius_mm)))
+    disk_radii_mm = [lcd_ring_radius_mm - 11.0, lcd_ring_radius_mm, lcd_ring_radius_mm + 11.0]
+    spokes = []
+    n_visible = 0
+    stop_counting = False
+
+    for i in range(n_spokes):
+        angle_deg = i * (360.0 / n_spokes) + lcd_angle_offset_deg
+        angle_rad = math.radians(angle_deg)
+        disk_radius_px_i = max(1, int(round((spoke_disk_diameters_mm[i] / 2.0) / px)))
+        disks = []
+        complete = True
+        for rr_mm in disk_radii_mm:
+            rr_px = int(round(rr_mm / px))
+            expected_r = int(cr - rr_px * math.cos(angle_rad))
+            expected_c = int(cc + rr_px * math.sin(angle_rad))
+
+            def _score_candidate(cand_r, cand_c):
+                cand_r = max(disk_radius_px_i, min(h - disk_radius_px_i - 1, int(cand_r)))
+                cand_c = max(disk_radius_px_i, min(w - disk_radius_px_i - 1, int(cand_c)))
+                disk_mask = ((X - cand_c) ** 2 + (Y - cand_r) ** 2) <= disk_radius_px_i ** 2
+                disk_values = arr[disk_mask]
+                disk_mean = float(np.mean(disk_values)) if disk_values.size else 0.0
+                disk_std = float(np.std(disk_values)) if disk_values.size else 0.0
+                local_outer = max(disk_radius_px_i + 3, int(round(disk_radius_px_i * 2.8)))
+                local_inner = disk_radius_px_i + 1
+                local_dist = np.sqrt((X - cand_c) ** 2 + (Y - cand_r) ** 2)
+                local_mask = (local_dist >= local_inner) & (local_dist <= local_outer)
+                local_values = arr[local_mask & (arr > 0)]
+                local_mean = float(np.mean(local_values)) if local_values.size else bg_mean
+                local_std = float(np.std(local_values)) if local_values.size else bg_std
+                cnr_global = abs(disk_mean - bg_mean) / bg_std if bg_std > 0 else 0.0
+                cnr_local = abs(disk_mean - local_mean) / local_std if local_std > 0 else 0.0
+                cnr = max(cnr_global, cnr_local)
+                return cnr, cand_r, cand_c, disk_mean, disk_std, local_mean, local_std, cnr_global, cnr_local
+
+            search_px = max(2, int(round(3.0 / max(px, 1e-6))))
+            best = None
+            for dr in range(-search_px, search_px + 1):
+                for dc in range(-search_px, search_px + 1):
+                    cand = _score_candidate(expected_r + dr, expected_c + dc)
+                    if best is None or cand[0] > best[0]:
+                        best = cand
+            cnr, disk_r, disk_c, disk_mean, disk_std, local_mean, local_std, cnr_global, cnr_local = best
+            visible_disk = cnr > 0.35
+            complete = complete and visible_disk
+            disks.append({
+                "center_rc": (disk_r, disk_c),
+                "radius_px": disk_radius_px_i,
+                "mean_signal": round(disk_mean, 2),
+                "std_signal": round(disk_std, 3),
+                "local_mean": round(local_mean, 2),
+                "local_std": round(local_std, 3),
+                "cnr_global": round(cnr_global, 2),
+                "cnr_local": round(cnr_local, 2),
+                "cnr": round(cnr, 2),
+                "visible": visible_disk,
+            })
+
+        visible = complete and not stop_counting
+        if visible:
+            n_visible += 1
+        else:
+            stop_counting = True
+
+        spokes.append({
+            "index": i,
+            "angle_deg": round(angle_deg, 1),
+            "center_rc": disks[1]["center_rc"],
+            "disk_diameter_mm": spoke_disk_diameters_mm[i],
+            "disks": disks,
+            "complete": complete,
+            "visible": visible,
+        })
+
+    passed = n_visible >= 2
+    return {
+        "n_visible": n_visible,
+        "n_total": n_spokes,
+        "spokes": spokes,
+        "bg_mean": round(bg_mean, 2),
+        "bg_std": round(bg_std, 4),
+        "passed": passed,
+        "spoke_radius_mm": 45.0,
+        "disk_radius_mm": 5.0,
+        "lcd_counting_rule": "complete spokes; stop at first incomplete",
+        "lcd_visibility_cnr_threshold": 0.35,
+        "lcd_angle_offset_deg": round(lcd_angle_offset_deg, 2),
+        "lcd_ring_radius_mm": round(lcd_ring_radius_mm, 2),
+        "lcd_ring_radius_px": round(float(lcd_ring_radius_mm / px), 2),
+        "lcd_disk_radii_mm": [round(float(v), 2) for v in disk_radii_mm],
         "center_rc": (cr, cc),
         "radius_px": r0,
     }

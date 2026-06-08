@@ -190,6 +190,160 @@ class MetaInfoRequest(BaseModel):
     note: str = ""
 
 
+def _valid_slice_indices(base_idx: int, offsets: List[int]) -> List[int]:
+    indices = []
+    for off in offsets:
+        idx = base_idx + off
+        if 0 <= idx < len(state.slices):
+            indices.append(idx)
+    return indices
+
+
+def _analyze_slice_position_pair(base_idx: int, kwargs: Optional[dict] = None) -> dict:
+    kwargs = dict(kwargs or {})
+    active_idx = kwargs.pop("active_slice_idx", base_idx)
+    overrides = kwargs.pop("slice_position_overrides", {}) or {}
+    indices = _valid_slice_indices(base_idx, [0, 10])
+    per_slice = []
+    primary = None
+    for idx in indices:
+        sl = state.slices[idx]
+        slice_kwargs = dict(overrides.get(str(idx), overrides.get(idx, {})))
+        if idx == active_idx:
+            slice_kwargs.update(kwargs)
+        result = calculate_slice_position(sl.pixel_array, sl.pixel_spacing_mm, **slice_kwargs)
+        result["slice_number_acr"] = idx - base_idx + 1 if idx != base_idx else 1
+        result["slice_idx"] = idx
+        result["slice_location"] = sl.slice_location
+        per_slice.append(result)
+        if idx == base_idx:
+            primary = result
+    if primary is None and per_slice:
+        primary = per_slice[0]
+    if primary is None:
+        raise HTTPException(400, "Slice posizione non disponibili")
+    max_abs = max(abs(r.get("slice_position_error_mm", 0.0)) for r in per_slice)
+    primary = dict(primary)
+    primary["slice_position_slices"] = per_slice
+    primary["slice_position_max_abs_error_mm"] = round(float(max_abs), 2)
+    primary["passed"] = all(r.get("passed", False) for r in per_slice)
+    primary["analysis_scope"] = "slice_1_and_11"
+    return primary
+
+
+def _analyze_low_contrast_stack(base_idx: int, kwargs: Optional[dict] = None) -> dict:
+    kwargs = dict(kwargs or {})
+    active_idx = kwargs.pop("active_slice_idx", base_idx)
+    overrides = kwargs.pop("lcd_overrides", {}) or {}
+    indices = _valid_slice_indices(base_idx, [0, 1, 2, 3])
+    per_slice = []
+    primary = None
+    total_visible = 0
+
+    def _lcd_score(result: dict) -> float:
+        score = float(result.get("n_visible", 0)) * 1000.0
+        for spoke in result.get("spokes", []):
+            disks = spoke.get("disks", [])
+            if disks:
+                score += min(float(d.get("cnr", 0.0)) for d in disks)
+            if spoke.get("complete"):
+                score += 5.0
+        return score
+
+    def _best_lcd_for_slice(idx: int, base_kwargs: dict, angles, radii) -> dict:
+        sl = state.slices[idx]
+        best = None
+        best_score = -1e18
+        for radius in radii:
+            for angle in angles:
+                trial_kwargs = dict(base_kwargs)
+                trial_kwargs["lcd_ring_radius_mm"] = float(radius)
+                trial_kwargs["lcd_angle_offset_deg"] = float(angle)
+                result = calculate_low_contrast(sl.pixel_array, sl.pixel_spacing_mm, **trial_kwargs)
+                score = _lcd_score(result)
+                if score > best_score:
+                    best = result
+                    best_score = score
+        return best
+
+    anchor_idx = indices[-1] if indices else base_idx
+    anchor_override = dict(overrides.get(str(anchor_idx), overrides.get(anchor_idx, {})))
+    if anchor_idx == active_idx:
+        anchor_override.update(kwargs)
+    if "lcd_ring_radius_mm" in anchor_override or "lcd_angle_offset_deg" in anchor_override:
+        anchor_result = calculate_low_contrast(
+            state.slices[anchor_idx].pixel_array,
+            state.slices[anchor_idx].pixel_spacing_mm,
+            **anchor_override,
+        )
+    else:
+        anchor_result = _best_lcd_for_slice(
+            anchor_idx,
+            anchor_override,
+            angles=[a for a in range(-18, 19, 3)],
+            radii=[r for r in range(32, 49, 2)],
+        )
+    anchor_angle = float(anchor_result.get("lcd_angle_offset_deg", 0.0))
+    anchor_radius = float(anchor_result.get("lcd_ring_radius_mm", 40.0))
+    anchor_center = anchor_result.get("center_rc")
+    anchor_phantom_radius = anchor_result.get("radius_px")
+
+    for pos, idx in enumerate(indices):
+        sl = state.slices[idx]
+        slice_kwargs = dict(overrides.get(str(idx), overrides.get(idx, {})))
+        if idx == active_idx:
+            slice_kwargs.update(kwargs)
+        if slice_kwargs:
+            result = calculate_low_contrast(sl.pixel_array, sl.pixel_spacing_mm, **slice_kwargs)
+        elif idx == anchor_idx:
+            result = anchor_result
+        else:
+            propagated = {}
+            if anchor_center:
+                propagated["center_rc"] = anchor_center
+            if anchor_phantom_radius:
+                propagated["radius_px"] = anchor_phantom_radius
+            result = _best_lcd_for_slice(
+                idx,
+                propagated,
+                angles=[anchor_angle + d for d in (-6, -3, 0, 3, 6)],
+                radii=[max(20.0, anchor_radius + d) for d in (-2, 0, 2)],
+            )
+        result["slice_number_acr"] = 8 + pos
+        result["slice_idx"] = idx
+        result["slice_location"] = sl.slice_location
+        per_slice.append(result)
+        total_visible += int(result.get("n_visible", 0))
+        if idx == base_idx:
+            primary = result
+    if primary is None and per_slice:
+        primary = per_slice[0]
+    if primary is None:
+        raise HTTPException(400, "Slice basso contrasto non disponibili")
+    field_T = state.slices[base_idx].magnetic_field_T or 1.5
+    if field_T >= 3.0:
+        t1_limit = t2_limit = 37
+    elif field_T >= 1.5:
+        t1_limit, t2_limit = 30, 25
+    else:
+        t1_limit = t2_limit = 7
+    primary = dict(primary)
+    primary["lcd_slices"] = per_slice
+    primary["lcd_total_visible"] = total_visible
+    primary["lcd_total_possible"] = 40
+    primary["lcd_limit_t1"] = t1_limit
+    primary["lcd_limit_t2"] = t2_limit
+    primary["passed_t1"] = total_visible >= t1_limit
+    primary["passed_t2"] = total_visible >= t2_limit
+    primary["passed"] = total_visible >= t2_limit
+    primary["field_T"] = field_T
+    primary["analysis_scope"] = "slices_8_to_11"
+    primary["lcd_anchor_slice"] = 11
+    primary["lcd_anchor_angle_offset_deg"] = round(anchor_angle, 2)
+    primary["lcd_anchor_ring_radius_mm"] = round(anchor_radius, 2)
+    return primary
+
+
 # ==============================================================================
 # UTILITY
 # ==============================================================================
@@ -347,7 +501,7 @@ async def analyze_module(req: AnalyzeRequest):
         elif module == "slice_thickness":
             result = calculate_slice_thickness(arr, ps, **kwargs)
         elif module == "slice_position":
-            result = calculate_slice_position(arr, ps, **kwargs)
+            result = _analyze_slice_position_pair(idx, kwargs)
         elif module == "psg":
             result = calculate_psg(arr, ps, **kwargs)
         elif module == "piu":
@@ -357,7 +511,7 @@ async def analyze_module(req: AnalyzeRequest):
             result["passed"] = result["piu_percent"] >= result["limit"]
             result["field_T"] = field_T
         elif module == "low_contrast":
-            result = calculate_low_contrast(arr, ps, **kwargs)
+            result = _analyze_low_contrast_stack(idx, kwargs)
         elif module == "snr":
             snr_idx2 = kwargs.pop("second_slice_idx", None)
             snr_method = kwargs.pop("snr_method", "single_lr")
@@ -422,7 +576,7 @@ async def analyze_all():
             elif module == "slice_thickness":
                 result = calculate_slice_thickness(arr, ps)
             elif module == "slice_position":
-                result = calculate_slice_position(arr, ps)
+                result = _analyze_slice_position_pair(idx)
             elif module == "psg":
                 result = calculate_psg(arr, ps)
             elif module == "piu":
@@ -431,7 +585,7 @@ async def analyze_all():
                 result["limit"] = 87.5 if field_T < 3.0 else 82.0
                 result["passed"] = result["piu_percent"] >= result["limit"]
             elif module == "low_contrast":
-                result = calculate_low_contrast(arr, ps)
+                result = _analyze_low_contrast_stack(idx)
             elif module == "snr":
                 result = calculate_snr_single_image(arr, ps)
             elif module == "snru":
