@@ -48,6 +48,8 @@ const API = {
 
   getModuleConfig() { return this.get("/module-config"); },
 
+  suggestSlices() { return this.get("/suggest-slices"); },
+
   assignSlices(assignments) {
     return this.post("/assign-slices", { assignments });
   },
@@ -65,4 +67,20 @@ const API = {
   getPixelValue(sliceIdx, row, col) {
     return this.get(`/pixel-value?slice_idx=${sliceIdx}&row=${row}&col=${col}`);
   },
+
+  // Multi-sequence & persistence
+  getSequences() { return this.get("/sequences"); },
+  setActiveSequence(uid) { return this.post("/set-active-sequence", { uid }); },
+  saveSession(filepath = "") { return this.post("/save-session", { filepath }); },
+  loadSession(filepath) { return this.post("/load-session", { filepath }); },
+  relaxometry(sliceIdx = 0, roiFraction = 0.75) {
+    return this.post("/relaxometry", { slice_idx: sliceIdx, roi_fraction: roiFraction });
+  },
+  browseFs(path = "") { return this.get(`/browse-fs?path=${encodeURIComponent(path)}`); },
+
+  loadDicomRecursive(inputDir) {
+    return this.post("/load-dicom", { input_dir: inputDir, recursive: true });
+  },
+
+  get _base() { return this.baseUrl; },
 };

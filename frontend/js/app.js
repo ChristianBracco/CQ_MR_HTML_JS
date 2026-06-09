@@ -1,25 +1,21 @@
-/**
- * app.js — MRI QC Analyzer
+﻿/**
+ * app.js - MRI QC Analyzer
  * Full interactive analysis: editable ROIs, zoom, WW/WL, dynamic re-analysis, SNR multi-method
  */
 "use strict";
 
 (async function main() {
-  // ═══════════════════════════════════════════════════════════════════════════
   // THEME
-  // ═══════════════════════════════════════════════════════════════════════════
   const themeBtn = document.getElementById("btn-theme-toggle");
   let darkMode = localStorage.getItem("mri_qc_theme") !== "light";
   applyTheme(darkMode);
   themeBtn?.addEventListener("click", () => { darkMode = !darkMode; applyTheme(darkMode); localStorage.setItem("mri_qc_theme", darkMode ? "dark" : "light"); });
-  function applyTheme(d) { if (d) { document.body.classList.remove("theme-light"); themeBtn.textContent = "🌙"; } else { document.body.classList.add("theme-light"); themeBtn.textContent = "☀️"; } }
+  function applyTheme(d) { if (d) { document.body.classList.remove("theme-light"); themeBtn.textContent = "Dark"; } else { document.body.classList.add("theme-light"); themeBtn.textContent = "Light"; } }
 
   // Step navigation
   document.querySelectorAll(".step-btn").forEach(btn => { btn.addEventListener("click", () => { const s = parseInt(btn.dataset.step); if (s <= AppState.currentStep) UI.showStep(s); }); });
 
-  // ═══════════════════════════════════════════════════════════════════════════
   // STEP 1: Load DICOM
-  // ═══════════════════════════════════════════════════════════════════════════
   const inputDir = document.getElementById("input-dir");
   const btnLoad = document.getElementById("btn-load");
   const savedPath = localStorage.getItem("mri_qc_input_dir");
@@ -27,23 +23,145 @@
   inputDir.addEventListener("input", () => { btnLoad.disabled = !inputDir.value.trim(); });
   inputDir.addEventListener("keydown", (e) => { if (e.key === "Enter") btnLoad.click(); });
 
+  // Filesystem browser button
+  const btnBrowse = document.getElementById("btn-browse");
+  if (btnBrowse) {
+    btnBrowse.addEventListener("click", () => openFsBrowser());
+  }
+
+  async function openFsBrowser() {
+    let currentPath = inputDir.value.trim() || "";
+    const modal = document.createElement("div");
+    modal.className = "modal-overlay";
+    modal.innerHTML = `<div class="modal-content fs-browser-modal">
+      <div class="modal-header"><h3>Seleziona cartella DICOM</h3><button class="modal-close">&times;</button></div>
+      <div class="fs-path-bar"><input type="text" id="fs-path-input" value="${currentPath}" style="flex:1;"/><button id="fs-go-btn" class="btn btn-xs btn-primary">Vai</button></div>
+      <div class="fs-entries" id="fs-entries" style="max-height:400px;overflow-y:auto;"></div>
+      <div class="modal-footer">
+        <span id="fs-info" style="font-size:11px;color:var(--text-muted);"></span>
+        <button id="fs-select-btn" class="btn btn-primary" disabled>Seleziona questa cartella</button>
+      </div>
+    </div>`;
+    document.body.appendChild(modal);
+    modal.querySelector(".modal-close").onclick = () => modal.remove();
+    modal.addEventListener("click", (e) => { if (e.target === modal) modal.remove(); });
+
+    const pathInput = modal.querySelector("#fs-path-input");
+    const entriesDiv = modal.querySelector("#fs-entries");
+    const selectBtn = modal.querySelector("#fs-select-btn");
+    const infoSpan = modal.querySelector("#fs-info");
+    const goBtn = modal.querySelector("#fs-go-btn");
+
+    async function navigateTo(path) {
+      try {
+        const resp = await API.browseFs(path);
+        currentPath = resp.current || "";
+        pathInput.value = currentPath;
+        selectBtn.disabled = !currentPath;
+        infoSpan.textContent = resp.dicom_file_count ? `${resp.dicom_file_count} file DICOM trovati` : "";
+
+        let html = "";
+        if (resp.parent !== undefined && resp.parent !== null) {
+          html += `<div class="fs-entry fs-dir" data-path="${resp.parent}">📁 ..</div>`;
+        }
+        for (const e of resp.entries) {
+          if (e.is_dir) {
+            html += `<div class="fs-entry fs-dir" data-path="${e.path}">📁 ${e.name}</div>`;
+          }
+        }
+        entriesDiv.innerHTML = html;
+        entriesDiv.querySelectorAll(".fs-dir").forEach(el => {
+          el.addEventListener("dblclick", () => navigateTo(el.dataset.path));
+        });
+      } catch (err) {
+        entriesDiv.innerHTML = `<div style="color:var(--accent-red);padding:8px;">${err.message}</div>`;
+      }
+    }
+
+    goBtn.onclick = () => navigateTo(pathInput.value.trim());
+    pathInput.addEventListener("keydown", (e) => { if (e.key === "Enter") navigateTo(pathInput.value.trim()); });
+    selectBtn.onclick = () => { inputDir.value = currentPath; btnLoad.disabled = false; modal.remove(); };
+
+    await navigateTo(currentPath);
+  }
+
   btnLoad.addEventListener("click", async () => {
     const dir = inputDir.value.trim(); if (!dir) return;
     localStorage.setItem("mri_qc_input_dir", dir);
-    UI.show("load-progress"); UI.setStatus("Caricamento DICOM MRI…");
+    UI.show("load-progress"); UI.setStatus("Caricamento DICOM MRI (ricorsivo)...");
     try {
-      const resp = await API.loadDicom(dir);
-      AppState.inputDir = dir; AppState.slices = resp.slices;
-      UI.setStatus(`✓ ${resp.n_slices} slice MRI caricate`);
-      UI.hide("load-progress");
-      try { AppState.dicomMeta = await API.getDicomMeta(); } catch (e) {}
-      setupStep2(); UI.showStep(2);
-    } catch (err) { UI.hide("load-progress"); UI.setStatus(`✗ ${err.message}`); alert(err.message); }
+      const resp = await API.loadDicomRecursive(dir);
+      AppState.inputDir = dir;
+
+      // If multiple sequences found, show selection modal
+      if (resp.sequences && resp.sequences.length > 1) {
+        UI.hide("load-progress");
+        await showSeriesModal(resp);
+      } else {
+        AppState.slices = resp.slices;
+        AppState.suggestedAssignments = resp.suggested_assignments || {};
+        UI.setStatus(`OK ${resp.n_slices} slice MRI caricate`);
+        UI.hide("load-progress");
+        try { AppState.dicomMeta = await API.getDicomMeta(); } catch (e) {}
+        setupStep2(); UI.showStep(2);
+      }
+    } catch (err) { UI.hide("load-progress"); UI.setStatus(`ERR ${err.message}`); alert(err.message); }
   });
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // STEP 2: Slice Selection — Grid S/M/L/XL, WW/WL, Auto-assign
-  // ═══════════════════════════════════════════════════════════════════════════
+  async function showSeriesModal(loadResp) {
+    const modal = document.createElement("div");
+    modal.className = "modal-overlay";
+    const rows = loadResp.sequences.map(s => `
+      <tr class="series-row ${s.is_active ? 'active' : ''}" data-uid="${s.uid}">
+        <td><strong>${s.description || '(no desc)'}</strong></td>
+        <td>${s.tr_ms.toFixed(0)}</td>
+        <td>${s.te_ms.toFixed(0)}</td>
+        <td>${s.n_slices}</td>
+        <td>${s.is_active ? '✓' : ''}</td>
+      </tr>`).join("");
+    modal.innerHTML = `<div class="modal-content">
+      <div class="modal-header"><h3>Sequenze trovate (${loadResp.sequences.length})</h3><button class="modal-close">&times;</button></div>
+      <p style="font-size:12px;color:var(--text-muted);margin:8px 0;">Totale ${loadResp.n_total_slices} slice. Seleziona la sequenza da analizzare:</p>
+      <table class="series-table">
+        <thead><tr><th>Descrizione</th><th>TR (ms)</th><th>TE (ms)</th><th>Slices</th><th>Attiva</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="modal-footer" style="margin-top:12px;">
+        <button id="series-confirm-btn" class="btn btn-primary">Carica sequenza selezionata</button>
+      </div>
+    </div>`;
+    document.body.appendChild(modal);
+    modal.querySelector(".modal-close").onclick = () => { modal.remove(); UI.setStatus("Annullato"); };
+
+    let selectedUid = loadResp.active_sequence_uid;
+    modal.querySelectorAll(".series-row").forEach(row => {
+      row.addEventListener("click", () => {
+        modal.querySelectorAll(".series-row").forEach(r => r.classList.remove("active"));
+        row.classList.add("active");
+        selectedUid = row.dataset.uid;
+      });
+    });
+
+    modal.querySelector("#series-confirm-btn").addEventListener("click", async () => {
+      modal.remove();
+      UI.setStatus("Caricamento sequenza...");
+      try {
+        if (selectedUid !== loadResp.active_sequence_uid) {
+          const switched = await API.setActiveSequence(selectedUid);
+          AppState.slices = switched.slices;
+          AppState.suggestedAssignments = switched.suggested_assignments || {};
+        } else {
+          AppState.slices = loadResp.slices;
+          AppState.suggestedAssignments = loadResp.suggested_assignments || {};
+        }
+        UI.setStatus(`OK ${AppState.slices.length} slice caricate`);
+        try { AppState.dicomMeta = await API.getDicomMeta(); } catch (e) {}
+        setupStep2(); UI.showStep(2);
+      } catch (err) { UI.setStatus(`ERR ${err.message}`); alert(err.message); }
+    });
+  }
+
+  // STEP 2: Slice Selection - Grid S/M/L/XL, WW/WL, Auto-assign
   async function setupStep2() { buildModuleLegend(); applyGridSize(); await refreshThumbnails(); autoAssign(); }
 
   function buildModuleLegend() {
@@ -53,7 +171,7 @@
       const chip = document.createElement("div");
       chip.className = `module-chip ${i === 0 ? "active" : ""}`;
       chip.style.cssText = `background:${color}22;color:${color};`;
-      chip.innerHTML = `<span class="dot" style="background:${color}"></span><span>${label}</span><span class="assigned-badge" id="chip-${mod}">—</span>`;
+      chip.innerHTML = `<span class="dot" style="background:${color}"></span><span>${label}</span><span class="assigned-badge" id="chip-${mod}">-</span>`;
       chip.addEventListener("click", () => { document.querySelectorAll(".module-chip").forEach(c => c.classList.remove("active")); chip.classList.add("active"); AppState.activeModule = mod; });
       legend.appendChild(chip);
     });
@@ -62,11 +180,15 @@
 
   function autoAssign() {
     const n = AppState.slices.length; if (n === 0) return;
-    for (const mod of AppState.moduleOrder) { const d = AppState.defaultSlices[mod]; if (d !== undefined && d < n) AppState.assignments[mod] = d; }
+    for (const mod of AppState.moduleOrder) {
+      const suggested = AppState.suggestedAssignments?.[mod];
+      const d = Number.isInteger(suggested) ? suggested : AppState.defaultSlices[mod];
+      if (d !== undefined && d >= 0 && d < n) AppState.assignments[mod] = d;
+    }
     updateAllBadges(); renderSliceGrid(); updateConfirmBtn();
     UI.setStatus(`Auto-assign: ${Object.keys(AppState.assignments).length} moduli`);
   }
-  function updateAllBadges() { for (const mod of AppState.moduleOrder) { const b = document.getElementById(`chip-${mod}`); if (b) b.textContent = (mod in AppState.assignments) ? `#${AppState.assignments[mod]}` : "—"; } }
+  function updateAllBadges() { for (const mod of AppState.moduleOrder) { const b = document.getElementById(`chip-${mod}`); if (b) b.textContent = (mod in AppState.assignments) ? `#${AppState.assignments[mod]}` : "-"; } }
 
   async function refreshThumbnails() {
     const wl = parseFloat(document.getElementById("wl-val").value) || null;
@@ -94,7 +216,7 @@
   }
 
   function applyGridSize() { const px = AppState.gridSizes[AppState.gridSize] || 120; const g = document.getElementById("slice-grid"); if (g) g.style.gridTemplateColumns = `repeat(auto-fill, minmax(${px}px, 1fr))`; }
-  function updateConfirmBtn() { const btn = document.getElementById("btn-confirm-slices"); const n = Object.keys(AppState.assignments).length; btn.disabled = n === 0; btn.textContent = `Conferma (${n}/${AppState.moduleOrder.length}) ›`; }
+  function updateConfirmBtn() { const btn = document.getElementById("btn-confirm-slices"); const n = Object.keys(AppState.assignments).length; btn.disabled = n === 0; btn.textContent = `Conferma (${n}/${AppState.moduleOrder.length}) >`; }
 
   document.querySelectorAll(".size-btn").forEach(btn => { btn.addEventListener("click", () => { document.querySelectorAll(".size-btn").forEach(b => b.classList.remove("active")); btn.classList.add("active"); AppState.gridSize = btn.dataset.size; applyGridSize(); }); });
   document.querySelectorAll(".preset-btn").forEach(btn => { btn.addEventListener("click", () => { document.querySelectorAll(".preset-btn").forEach(b => b.classList.remove("active")); btn.classList.add("active"); document.getElementById("wl-val").value = btn.dataset.wl; document.getElementById("ww-val").value = btn.dataset.ww; refreshThumbnails(); }); });
@@ -104,15 +226,13 @@
   document.getElementById("btn-auto-assign").addEventListener("click", () => { AppState.assignments = {}; autoAssign(); });
   document.getElementById("btn-confirm-slices").addEventListener("click", () => { setupStep3(); UI.showStep(3); });
 
-  // ═══════════════════════════════════════════════════════════════════════════
   // STEP 3: Info QC
-  // ═══════════════════════════════════════════════════════════════════════════
   function setupStep3() {
     const d = document.getElementById("info-date"); if (d && !d.value) d.value = new Date().toISOString().split("T")[0];
     const card = document.getElementById("dicom-meta-card"), m = AppState.dicomMeta;
     if (!m) { card.innerHTML = ""; return; }
-    const it = (l,v) => `<div class="meta-item"><span class="meta-label">${l}</span><span class="meta-value">${v||"–"}</span></div>`;
-    card.innerHTML = `<h3>Metadati DICOM MRI</h3><div class="meta-grid">${it("Produttore",m.manufacturer)}${it("Modello",m.model)}${it("Campo B₀",m.magnetic_field_T+" T")}${it("TR/TE",m.tr_ms+"/"+m.te_ms+" ms")}${it("Pixel Spacing",m.pixel_spacing_mm+" mm")}${it("Spessore",m.slice_thickness_mm+" mm")}${it("FOV",m.fov_mm+" mm")}${it("Matrice",m.matrix_size)}${it("N. Averages",m.n_averages)}${it("Data",m.study_date)}${it("N. Slice",m.n_slices)}</div>`;
+    const it = (l,v) => `<div class="meta-item"><span class="meta-label">${l}</span><span class="meta-value">${v||"-"}</span></div>`;
+    card.innerHTML = `<h3>Metadati DICOM MRI</h3><div class="meta-grid">${it("Produttore",m.manufacturer)}${it("Modello",m.model)}${it("Campo B0",m.magnetic_field_T+" T")}${it("TR/TE",m.tr_ms+"/"+m.te_ms+" ms")}${it("Pixel Spacing",m.pixel_spacing_mm+" mm")}${it("Spessore",m.slice_thickness_mm+" mm")}${it("FOV",m.fov_mm+" mm")}${it("Matrice",m.matrix_size)}${it("N. Averages",m.n_averages)}${it("Data",m.study_date)}${it("N. Slice",m.n_slices)}</div>`;
   }
   document.getElementById("btn-start-analysis").addEventListener("click", () => {
     AppState.metaInfo = { data_controllo: document.getElementById("info-date").value, tipo_controllo: document.getElementById("info-type").value, presidio: document.getElementById("info-presidio").value, sala: document.getElementById("info-sala").value, operatori: document.getElementById("info-operatori").value, note: document.getElementById("info-note").value };
@@ -121,13 +241,20 @@
     setupStep4(); UI.showStep(4);
   });
 
-  // ═══════════════════════════════════════════════════════════════════════════
   // STEP 4: Interactive Analysis with editable ROIs, zoom, WW/WL, live update
-  // ═══════════════════════════════════════════════════════════════════════════
   let _zoom = 1, _autoTimer = null;
   const _activeResultView = {};
 
   function setupStep4() { buildAnalysisTabs(); const mods = AppState.moduleOrder.filter(m => m in AppState.assignments); if (mods.length > 0) showModule(mods[0]); }
+
+  function buildSnrSecondSliceOptions(primaryIdx) {
+    return AppState.slices.map((sl, i) => {
+      const z = sl.z ?? sl.slice_location ?? "";
+      const label = `#${i}${z !== "" ? `  z=${z}` : ""}${i === primaryIdx ? "  (corrente)" : ""}`;
+      const selected = i === Math.min(primaryIdx + 1, AppState.slices.length - 1) ? "selected" : "";
+      return `<option value="${i}" ${selected}>${label}</option>`;
+    }).join("");
+  }
 
   function buildAnalysisTabs() {
     const bar = document.getElementById("module-tabs"); bar.innerHTML = "";
@@ -148,13 +275,16 @@
       <div style="margin-bottom:10px;padding:8px;background:var(--bg-surface);border-radius:var(--radius);border:1px solid var(--border);">
         <label style="font-size:11px;font-weight:600;color:var(--accent-cyan);">Metodo SNR (da articolo Epistatou et al.):</label>
         <select id="snr-method" style="margin-top:4px;width:100%;font-size:12px;">
-          <option value="single_lr">A) Singola immagine — σ(L+R) — Eq.7</option>
-          <option value="single_ud">A) Singola immagine — σ(U+D)</option>
-          <option value="single_all">A) Singola immagine — σ(L+R+U+D)</option>
-          <option value="two_image">C) Due immagini subtraction — Eq.6</option>
+          <option value="single_lr">A) Singola immagine - sigma(L+R) - Eq.7</option>
+          <option value="single_ud">A) Singola immagine - sigma(U+D)</option>
+          <option value="single_all">A) Singola immagine - sigma(L+R+U+D)</option>
+          <option value="two_image">C) Due immagini subtraction - Eq.6</option>
         </select>
         <div id="snr-second-slice-wrap" class="hidden" style="margin-top:6px;">
-          <label style="font-size:11px;">Indice seconda slice: <input type="number" id="snr-second-idx" value="${Math.min(idx+1, AppState.slices.length-1)}" min="0" max="${AppState.slices.length-1}" style="width:50px;font-size:11px;" /></label>
+          <label style="font-size:11px;font-weight:600;color:var(--accent-cyan);display:block;">Seconda immagine</label>
+          <select id="snr-second-idx" style="margin-top:4px;width:100%;font-size:12px;">
+            ${buildSnrSecondSliceOptions(idx)}
+          </select>
         </div>
       </div>` : "";
     const piuControlsHtml = mod === "piu" ? `
@@ -169,12 +299,12 @@
       <div style="margin-bottom:10px;padding:8px;background:var(--bg-surface);border-radius:var(--radius);border:1px solid var(--border);">
         <label style="font-size:11px;font-weight:600;color:var(--accent-pink);">Rotazione spoke</label>
         <div style="display:flex;align-items:center;gap:8px;margin-top:4px;">
-          <input type="range" id="lcd-angle-offset" min="-18" max="18" step="0.5" value="0" style="flex:1;" />
-          <span id="lbl-lcd-angle" style="font-size:11px;font-weight:700;min-width:46px;">0°</span>
+          <input type="range" id="lcd-angle-offset" min="-180" max="180" step="0.5" value="0" style="flex:1;" />
+          <span id="lbl-lcd-angle" style="font-size:11px;font-weight:700;min-width:46px;">0 deg</span>
         </div>
-        <label style="font-size:11px;font-weight:600;color:var(--accent-pink);display:block;margin-top:8px;">Raggio corona spoke</label>
+        <label style="font-size:11px;font-weight:600;color:var(--accent-pink);display:block;margin-top:8px;">Raggio esterno oggetti</label>
         <div style="display:flex;align-items:center;gap:8px;margin-top:4px;">
-          <input type="range" id="lcd-ring-radius" min="25" max="55" step="0.5" value="40" style="flex:1;" />
+          <input type="range" id="lcd-ring-radius" min="15" max="70" step="0.5" value="40" style="flex:1;" />
           <span id="lbl-lcd-radius" style="font-size:11px;font-weight:700;min-width:52px;">40 mm</span>
         </div>
       </div>` : "";
@@ -182,11 +312,11 @@
     content.innerHTML = `<div class="module-layout">
       <div class="module-image-panel">
         <div class="canvas-wrap" id="canvas-wrap"><canvas id="mod-canvas"></canvas><canvas id="mod-overlay"></canvas></div>
-        <div class="hu-readout" id="hu-readout">—</div>
+        <div class="hu-readout" id="hu-readout">-</div>
         <div class="canvas-controls">
           <label>WL <input type="range" id="mod-wl" min="0" max="2000" value="500" step="10"/><span id="lbl-wl">500</span></label>
           <label>WW <input type="range" id="mod-ww" min="1" max="3000" value="1000" step="10"/><span id="lbl-ww">1000</span></label>
-          <label>Zoom <input type="range" id="mod-zoom" min="1" max="6" step="0.5" value="1"/><span id="lbl-zoom">1×</span></label>
+          <label>Zoom <input type="range" id="mod-zoom" min="1" max="6" step="0.5" value="1"/><span id="lbl-zoom">1x</span></label>
         </div>
       </div>
       <div class="module-results-panel">
@@ -195,9 +325,9 @@
           ${snrMethodHtml}
           ${piuControlsHtml}
           ${lcdControlsHtml}
-          <p style="font-size:10px;color:var(--text-muted);margin-bottom:8px;">Tutte le ROI sono modificabili: <b>drag</b> per spostare, <b>dblclick</b> per aggiungere, <b>right-click</b> per rimuovere. L'analisi si aggiorna automaticamente.</p>
-          <button class="btn btn-primary" id="btn-run">⚡ Analizza</button>
-          <button class="btn btn-xs btn-secondary" id="btn-reset-roi" style="margin-left:6px;">↺ Reset ROI</button>
+          <p style="font-size:10px;color:var(--text-muted);margin-bottom:8px;">Le ROI sono modificabili dove previsto: <b>drag</b> per spostare, <b>dblclick</b> per aggiungere, <b>right-click</b> per rimuovere. Le linee geometriche H/V sono trascinabili e si adattano automaticamente al cilindro.</p>
+          <button class="btn btn-primary" id="btn-run"> Analizza</button>
+          <button class="btn btn-xs btn-secondary" id="btn-reset-roi" style="margin-left:6px;">Reset ROI</button>
         </div>
         <div id="mod-results-area"></div>
       </div>
@@ -233,6 +363,16 @@
         }
         runAnalysis("snr");
       });
+      const secondSel = document.getElementById("snr-second-idx");
+      secondSel?.addEventListener("change", () => {
+        const btn = document.getElementById("btn-run");
+        if (btn) {
+          btn.dataset.mode = "run";
+          btn.textContent = "Analizza";
+          btn.className = "btn btn-primary";
+        }
+        if (sel.value === "two_image") runAnalysis("snr");
+      });
     }
     if (mod === "piu") {
       const piuSlider = document.getElementById("piu-ufov-fraction");
@@ -245,13 +385,26 @@
     if (mod === "low_contrast") {
       const angle = document.getElementById("lcd-angle-offset");
       const radius = document.getElementById("lcd-ring-radius");
+      const syncAnchorFromSliders = () => {
+        const r = getActiveResult(mod);
+        if (!r?.center_rc || !r.lcd_anchor_outer_rc) return;
+        const px = r.pixel_spacing_mm || AppState.slices?.[r.slice_idx ?? idx]?.pixel_spacing_mm || 1;
+        const a = parseFloat(angle?.value || "0") * Math.PI / 180;
+        const rrPx = parseFloat(radius?.value || "40") / Math.max(px, 1e-6);
+        r.lcd_anchor_outer_rc = [
+          Math.round(r.center_rc[0] - rrPx * Math.cos(a)),
+          Math.round(r.center_rc[1] + rrPx * Math.sin(a)),
+        ];
+        drawRoisOnOverlay(r);
+      };
       const updateLcdLabels = () => {
         const a = parseFloat(angle?.value || "0");
         const rr = parseFloat(radius?.value || "40");
         const la = document.getElementById("lbl-lcd-angle");
         const lr = document.getElementById("lbl-lcd-radius");
-        if (la) la.textContent = `${a.toFixed(1)}°`;
+        if (la) la.textContent = `${a.toFixed(1)} deg`;
         if (lr) lr.textContent = `${rr.toFixed(1)} mm`;
+        syncAnchorFromSliders();
       };
       angle?.addEventListener("input", updateLcdLabels);
       radius?.addEventListener("input", updateLcdLabels);
@@ -303,8 +456,8 @@
     };
     wl.addEventListener("input", () => { document.getElementById("lbl-wl").textContent = wl.value; reload(); });
     ww.addEventListener("input", () => { document.getElementById("lbl-ww").textContent = ww.value; reload(); });
-    zm.addEventListener("input", () => { _zoom = +zm.value; document.getElementById("lbl-zoom").textContent = `${_zoom}×`; applyZoom(); });
-    document.getElementById("canvas-wrap").addEventListener("wheel", (e) => { e.preventDefault(); _zoom = Math.max(1, Math.min(6, _zoom + (e.deltaY < 0 ? 0.5 : -0.5))); zm.value = _zoom; document.getElementById("lbl-zoom").textContent = `${_zoom}×`; applyZoom(); });
+    zm.addEventListener("input", () => { _zoom = +zm.value; document.getElementById("lbl-zoom").textContent = `${_zoom}x`; applyZoom(); });
+    document.getElementById("canvas-wrap").addEventListener("wheel", (e) => { e.preventDefault(); _zoom = Math.max(1, Math.min(6, _zoom + (e.deltaY < 0 ? 0.5 : -0.5))); zm.value = _zoom; document.getElementById("lbl-zoom").textContent = `${_zoom}x`; applyZoom(); });
   }
 
   function applyZoom() {
@@ -355,15 +508,12 @@
     const angle = document.getElementById("lcd-angle-offset");
     const radius = document.getElementById("lcd-ring-radius");
     if (!angle || !radius || !result) return;
-    if (result.lcd_angle_offset_deg !== undefined) angle.value = String(result.lcd_angle_offset_deg);
-    if (result.lcd_ring_radius_mm !== undefined) radius.value = String(result.lcd_ring_radius_mm);
     const la = document.getElementById("lbl-lcd-angle");
     const lr = document.getElementById("lbl-lcd-radius");
-    if (la) la.textContent = `${parseFloat(angle.value || "0").toFixed(1)}°`;
+    if (la) la.textContent = `${parseFloat(angle.value || "0").toFixed(1)} deg`;
     if (lr) lr.textContent = `${parseFloat(radius.value || "40").toFixed(1)} mm`;
   }
 
-  // ── Elegant ROI drawing on overlay canvas ──────────────────────────────────
   function drawServerOverlay(resp) {
     // Instead of showing the server PNG overlay, we draw ROIs CLIENT-SIDE
     // on the transparent overlay canvas. This makes them interactive.
@@ -374,7 +524,7 @@
 
   /**
    * Draw all ROIs from analysis results on the overlay canvas.
-   * Style: medical imaging — colored strokes, text with dark outline for contrast.
+   * Style: medical imaging - colored strokes, text with dark outline for contrast.
    */
   function drawRoisOnOverlay(r) {
     const overlay = document.getElementById("mod-overlay");
@@ -487,7 +637,6 @@
       ctx.moveTo(cx, cy - size); ctx.lineTo(cx, cy + size); ctx.stroke();
     }
 
-    // ── Draw phantom outline + center ──
     const cr = r.center_rc ? r.center_rc[0] : null;
     const cc = r.center_rc ? r.center_rc[1] : null;
     const r0 = r.radius_px || 0;
@@ -497,14 +646,12 @@
       drawCross(cc, cr, 10, "#22d3ee");
     }
 
-    // ── UFOV circle ──
     const rUfov = r.ufov_radius_px || 0;
     if (rUfov > 0 && cc !== null) {
       dashedCircle(cc, cr, rUfov, "#22c55e", 1.5, [4, 3]);
       strokeText("UFOV", cc, cr - rUfov - 4, "#22c55e", "9px sans-serif");
     }
 
-    // ── PSG: 4 background rectangular ROIs ──
     if (r.rois && typeof r.rois === "object" && !Array.isArray(r.rois)) {
       const roiColors = { right: "#fb923c", left: "#fb923c", up: "#60a5fa", down: "#60a5fa" };
       for (const [name, roi] of Object.entries(r.rois)) {
@@ -519,14 +666,12 @@
       }
     }
 
-    // ── PSG signal label ──
     if (r.psg_percent !== undefined && cc !== null) {
       const passed = r.passed;
       const color = passed ? "#22c55e" : "#ef4444";
       strokeText(`PSG = ${r.psg_percent.toFixed(3)}%`, cc, 14, color, "bold 12px sans-serif", "center", "top");
     }
 
-    // ── PIU: max and min positions ──
     if (r.max_position_rc && r.min_position_rc) {
       const [maxR, maxC] = r.max_position_rc;
       const [minR, minC] = r.min_position_rc;
@@ -541,14 +686,12 @@
       }
     }
 
-    // ── SNR: UFOV + background ROIs ──
     if (r.snr !== undefined && r.std_left !== undefined && cc !== null) {
       // The UFOV is already drawn above. Add SNR label.
       const color = "#eab308";
       strokeText(`SNR = ${(r.snr_lr || r.snr).toFixed(1)}`, cc, cr, color, "bold 14px sans-serif");
     }
 
-    // ── SNRU: 5 circular ROIs ──
     if (r.rois && Array.isArray(r.rois) && r.rois.length > 0 && r.rois[0].center_rc) {
       for (const roi of r.rois) {
         const [ry, rx] = roi.center_rc;
@@ -562,12 +705,38 @@
       }
     }
 
-    // ── Geometric: diameter measurement lines with endpoints ──
     if (r.h_line_row !== undefined && r.h_line_endpoints && r.v_line_col !== undefined && r.v_line_endpoints) {
       const hRow = r.h_line_row;
-      const [hLeft, hRight] = r.h_line_endpoints;
       const vCol = r.v_line_col;
-      const [vTop, vBottom] = r.v_line_endpoints;
+
+      // Auto-adapt endpoints to the phantom circle (cyan outline)
+      // The circle is defined by center_rc and radius_px
+      let hLeft, hRight, vTop, vBottom;
+      if (cr !== null && r0 > 0) {
+        // Horizontal line intersection with circle: x = cx ± sqrt(r² - (y-cy)²)
+        const dyH = hRow - cr;
+        const discH = r0 * r0 - dyH * dyH;
+        if (discH > 0) {
+          const sqH = Math.sqrt(discH);
+          hLeft = cc - sqH;
+          hRight = cc + sqH;
+        } else {
+          [hLeft, hRight] = r.h_line_endpoints;
+        }
+        // Vertical line intersection with circle: y = cy ± sqrt(r² - (x-cx)²)
+        const dxV = vCol - cc;
+        const discV = r0 * r0 - dxV * dxV;
+        if (discV > 0) {
+          const sqV = Math.sqrt(discV);
+          vTop = cr - sqV;
+          vBottom = cr + sqV;
+        } else {
+          [vTop, vBottom] = r.v_line_endpoints;
+        }
+      } else {
+        [hLeft, hRight] = r.h_line_endpoints;
+        [vTop, vBottom] = r.v_line_endpoints;
+      }
 
       // Horizontal measurement line
       ctx.strokeStyle = "#f97316"; ctx.lineWidth = 2; ctx.setLineDash([]);
@@ -591,24 +760,68 @@
         ctx.setLineDash([4, 4]);
         ctx.lineWidth = 1.5;
         for (const line of r.oblique_lines.filter(Boolean)) {
-          const p1 = line.endpoints_rc?.[0];
-          const p2 = line.endpoints_rc?.[1];
-          if (!p1 || !p2) continue;
+          // Auto-adapt oblique lines to the phantom circle
+          const angleDeg = parseFloat(line.name);
+          const angleRad = angleDeg * Math.PI / 180;
+          let p1col, p1row, p2col, p2row;
+          if (cr !== null && r0 > 0) {
+            // Line through center at angle: parametric intersection with circle
+            const dx = Math.cos(angleRad);
+            const dy = -Math.sin(angleRad);
+            p1col = cc - r0 * dx;
+            p1row = cr + r0 * dy;
+            p2col = cc + r0 * dx;
+            p2row = cr - r0 * dy;
+          } else {
+            const ep1 = line.endpoints_rc?.[0];
+            const ep2 = line.endpoints_rc?.[1];
+            if (!ep1 || !ep2) continue;
+            p1col = ep1[1]; p1row = ep1[0];
+            p2col = ep2[1]; p2row = ep2[0];
+          }
           ctx.strokeStyle = line.name === "45" ? "#a855f7" : "#14b8a6";
           ctx.beginPath();
-          ctx.moveTo(p1[1], p1[0]);
-          ctx.lineTo(p2[1], p2[0]);
+          ctx.moveTo(p1col, p1row);
+          ctx.lineTo(p2col, p2row);
           ctx.stroke();
-          strokeText(`${line.name} deg ${line.diameter_mm.toFixed(1)} mm`, (p1[1] + p2[1]) / 2, (p1[0] + p2[0]) / 2 - 8, ctx.strokeStyle, "bold 10px sans-serif");
+          strokeText(`${line.name}\u00b0 ${line.diameter_mm.toFixed(1)} mm`, (p1col + p2col) / 2, (p1row + p2row) / 2 - 8, ctx.strokeStyle, "bold 10px sans-serif");
         }
         ctx.setLineDash([]);
       }
 
+      // Draw grid insert square (always visible on geometric slice)
+      // The insert is ~148mm for Large (78% of 190mm diameter) or ~120mm for Medium
+      if (cr !== null && r0 > 0) {
+        const insertFraction = (r.nominal_diameter_mm >= 180) ? 0.78 : 0.73;
+        const insertHalfPx = r0 * insertFraction;
+        ctx.strokeStyle = "#fbbf24";
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 3]);
+        ctx.strokeRect(cc - insertHalfPx, cr - insertHalfPx, insertHalfPx * 2, insertHalfPx * 2);
+        ctx.setLineDash([]);
+      }
+
+      // Draw grid dots if detected
+      if (Array.isArray(r.grid_dots) && r.grid_dots.length > 0) {
+        ctx.fillStyle = "#fbbf24";
+        ctx.globalAlpha = 0.85;
+        for (const dot of r.grid_dots) {
+          ctx.beginPath();
+          ctx.arc(dot[1], dot[0], 3, 0, 2 * Math.PI);
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1.0;
+        const nDots = r.grid_distortion ? r.grid_distortion.n_dots_detected : r.grid_dots.length;
+        strokeText(`${nDots} punti griglia`, cc, cr - (r0 * 0.78) - 8, "#fbbf24", "bold 10px sans-serif");
+      } else if (r.grid_distortion && r.grid_distortion.n_dots_detected > 0) {
+        strokeText(`${r.grid_distortion.n_dots_detected} punti`, cc, cr - (r0 * 0.78) - 8, "#fbbf24", "bold 10px sans-serif");
+      }
+
       // Pass/fail title
       const color = r.passed ? "#22c55e" : "#ef4444";
-      strokeText(`Geometria: ${r.passed ? "PASS" : "FAIL"} (lim ±${r.limit_mm}mm)`, overlay.width / 2, 14, color, "bold 11px sans-serif", "center", "top");
+      strokeText(`Geometria: ${r.passed ? "PASS" : "FAIL"} (lim +/-${r.limit_mm}mm)`, overlay.width / 2, 14, color, "bold 11px sans-serif", "center", "top");
     } else if (r.diameter_h_mm !== undefined && cr !== null && r0 > 0) {
-      // Fallback: draw lines from center ± radius
+      // Fallback: draw lines from center +/- radius
       ctx.strokeStyle = "#f97316"; ctx.lineWidth = 2; ctx.setLineDash([]);
       ctx.beginPath(); ctx.moveTo(cc - r0, cr); ctx.lineTo(cc + r0, cr); ctx.stroke();
       ctx.beginPath(); ctx.moveTo(cc, cr - r0); ctx.lineTo(cc, cr + r0); ctx.stroke();
@@ -616,14 +829,13 @@
       strokeText(`V=${r.diameter_v_mm.toFixed(1)}mm`, cc + r0 + 4, cr, "#f97316", "bold 10px sans-serif", "left", "middle");
     }
 
-    // ── Slice thickness: ramp ROI rectangles ──
     if (r.top_ramp_rect && r.bot_ramp_rect) {
       const [ty, tx, th, tw] = r.top_ramp_rect;
       const [by, bx, bh, bw] = r.bot_ramp_rect;
       drawRampRoi(ty, tx, th, tw, "#22d3ee");
-      strokeText("Rampa ↑", tx + tw/2, ty - 4, "#22d3ee", "bold 9px sans-serif");
+      strokeText("Rampa up", tx + tw/2, ty - 4, "#22d3ee", "bold 9px sans-serif");
       drawRampRoi(by, bx, bh, bw, "#fb923c");
-      strokeText("Rampa ↓", bx + bw/2, by - 4, "#fb923c", "bold 9px sans-serif");
+      strokeText("Rampa down", bx + bw/2, by - 4, "#fb923c", "bold 9px sans-serif");
       // Show FWHM values
       if (r.top_ramp_length_mm !== undefined) {
         labelBox(`Top ${r.top_ramp_length_mm.toFixed(1)} mm`, tx + tw/2, ty - 12, "#22d3ee", "bold 10px sans-serif");
@@ -656,10 +868,9 @@
       strokeText(`Spessore = ${r.measured_thickness_mm.toFixed(2)} mm (nom. ${r.nominal_thickness_mm} mm)`, overlay.width/2, 14, color, "bold 11px sans-serif", "center", "top");
     } else if (r.top_ramp_length_mm !== undefined && cr !== null) {
       // Fallback: just show text
-      strokeText(`Ramp ↑${r.top_ramp_length_mm.toFixed(1)}mm ↓${r.bottom_ramp_length_mm.toFixed(1)}mm`, cc || overlay.width/2, 14, "#06b6d4", "bold 10px sans-serif", "center", "top");
+      strokeText(`Ramp up${r.top_ramp_length_mm.toFixed(1)}mm down${r.bottom_ramp_length_mm.toFixed(1)}mm`, cc || overlay.width/2, 14, "#06b6d4", "bold 10px sans-serif", "center", "top");
     }
 
-    // ── Resolution: grid ROI rectangles ──
     if (r.grid_rects && r.grid_rects.length > 0) {
       const labels = ["1.1mm", "1.0mm", "0.9mm"];
       const mods = [r.modulation_1_1mm, r.modulation_1_0mm, r.modulation_0_9mm];
@@ -687,19 +898,66 @@
             ctx.stroke();
           }
         }
+        const line = r.resolution_line_profiles?.[i];
+        if (line) {
+          ctx.strokeStyle = "rgba(250,204,21,0.75)";
+          ctx.lineWidth = 1.2;
+          ctx.setLineDash([4, 3]);
+          for (const prof of line.horizontal_profiles || []) {
+            if (prof.resolved) {
+              ctx.beginPath();
+              ctx.moveTo(prof.col_start, prof.row);
+              ctx.lineTo(prof.col_end, prof.row);
+              ctx.stroke();
+            }
+          }
+          for (const prof of line.vertical_profiles || []) {
+            if (prof.resolved) {
+              ctx.beginPath();
+              ctx.moveTo(prof.col, prof.row_start);
+              ctx.lineTo(prof.col, prof.row_end);
+              ctx.stroke();
+            }
+          }
+          ctx.setLineDash([]);
+        }
       }
       const resColor = r.passed ? "#22c55e" : "#ef4444";
       const resText = r.resolved_mm === null || r.resolved_mm === undefined ? "Risoluzione assistita" : `Risoluzione = ${r.resolved_mm} mm`;
       strokeText(resText, overlay.width/2, 14, resColor, "bold 11px sans-serif", "center", "top");
     }
 
-    // ── Low contrast: visible count + spoke positions ──
     if (r.n_visible !== undefined && r.n_total !== undefined) {
       const color = r.passed ? "#22c55e" : "#ef4444";
       strokeText(`${r.n_visible}/${r.n_total} visibili`, overlay.width/2, 14, color, "bold 12px sans-serif", "center", "top");
       if (r.lcd_ring_radius_px !== undefined && r.center_rc) {
         const ringPx = r.lcd_ring_radius_px;
         dashedCircle(r.center_rc[1], r.center_rc[0], ringPx, "rgba(244,114,182,0.75)", 1.2, [3, 3]);
+      }
+      if (r.lcd_anchor_outer_rc && r.center_rc) {
+        const [ar, ac] = r.lcd_anchor_outer_rc;
+        const [cr0, cc0] = r.center_rc;
+        ctx.save();
+        ctx.strokeStyle = "rgba(14,165,233,0.9)";
+        ctx.lineWidth = 1.4;
+        ctx.setLineDash([5, 3]);
+        ctx.beginPath();
+        ctx.moveTo(cc0, cr0);
+        ctx.lineTo(ac, ar);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = "rgba(14,165,233,0.22)";
+        ctx.beginPath();
+        ctx.arc(ac, ar, 7, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "#0ea5e9";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.restore();
+        labelBox("Spoke 1", ac, ar - 14, "#7dd3fc", "bold 10px sans-serif");
+      }
+      if (r.lcd_annulus_radius_px !== undefined && r.lcd_annulus_radius_px && r.center_rc) {
+        dashedCircle(r.center_rc[1], r.center_rc[0], r.lcd_annulus_radius_px, "rgba(14,165,233,0.8)", 1.2, [7, 4]);
       }
       // Draw spoke positions if available
       if (r.spokes && r.spokes.length > 0) {
@@ -719,7 +977,6 @@
       }
     }
 
-    // ── Slice position: vertical profile lines ──
     if (r.bar_length_1_mm !== undefined && cr !== null) {
       const color = r.passed ? "#22c55e" : "#ef4444";
       if (r.left_bar_rect && r.right_bar_rect) {
@@ -765,7 +1022,6 @@
     }
   }
 
-  // ── ROI Interaction: drag ROIs, live re-analysis ─────────────────────────────
   let _dragState = null; // { type, index, startX, startY, origRect }
 
   function bindRoiInteraction(mod, idx) {
@@ -778,17 +1034,26 @@
       // If dragging, move the ROI
       if (_dragState) {
         handleDrag(e, mod);
-        overlay.style.cursor = "grabbing";
+        if (_dragState.type === "h_line") overlay.style.cursor = "ns-resize";
+        else if (_dragState.type === "v_line") overlay.style.cursor = "ew-resize";
+        else overlay.style.cursor = "grabbing";
         return;
       }
-      // Check if hovering over a draggable ROI → change cursor
+      // Check if hovering over a draggable ROI -> change cursor
       const [row, col] = eventToPixel(e, overlay);
       const hit = hitTestRoi(row, col, mod);
-      overlay.style.cursor = hit ? "grab" : "crosshair";
+      if (hit) {
+        if (hit.type === "h_line") overlay.style.cursor = "ns-resize";
+        else if (hit.type === "v_line") overlay.style.cursor = "ew-resize";
+        else overlay.style.cursor = "grab";
+      } else {
+        overlay.style.cursor = "crosshair";
+      }
 
       // HU readout (debounced)
       clearTimeout(ht); ht = setTimeout(() => {
-        API.getPixelValue(idx, row, col).then(r => { document.getElementById("hu-readout").textContent = `(${r.row},${r.col}) = ${r.value}`; }).catch(() => {});
+        const activeIdx = getActiveResult(mod)?.slice_idx ?? idx;
+        API.getPixelValue(activeIdx, row, col).then(r => { document.getElementById("hu-readout").textContent = `(${r.row},${r.col}) = ${r.value}`; }).catch(() => {});
       }, 80);
     });
 
@@ -823,8 +1088,18 @@
       }
     });
 
-    // Double-click: trigger re-analysis
-    overlay.addEventListener("dblclick", () => { scheduleAutoAnalysis(mod); });
+    // Double-click: for LCD place the spoke-1 outer anchor; otherwise re-analysis.
+    overlay.addEventListener("dblclick", (e) => {
+      if (mod === "low_contrast") {
+        const r = getActiveResult(mod);
+        if (r) {
+          const [row, col] = eventToPixel(e, overlay);
+          r.lcd_anchor_outer_rc = [row, col];
+          drawRoisOnOverlay(r);
+        }
+      }
+      scheduleAutoAnalysis(mod);
+    });
   }
 
   function eventToPixel(e, overlay) {
@@ -838,25 +1113,18 @@
     const r = getActiveResult(mod);
     if (!r) return null;
 
+    if (mod === "low_contrast" && r.lcd_anchor_outer_rc) {
+      const [ar, ac] = r.lcd_anchor_outer_rc;
+      if (Math.hypot(col - ac, row - ar) <= 12) {
+        return { type: "lcd_anchor_outer" };
+      }
+    }
+
     // Test phantom center cross (drag to move all ROIs)
     if (r.center_rc) {
       const [cr, cc] = r.center_rc;
       if (Math.hypot(col - cc, row - cr) <= 12) {
         return { type: "center" };
-      }
-    }
-
-    // Test geometric measurement lines (drag to move the line row/col)
-    if (r.h_line_row !== undefined) {
-      const [hL, hR] = r.h_line_endpoints || [0, 0];
-      if (Math.abs(row - r.h_line_row) <= 6 && col >= hL - 10 && col <= hR + 10) {
-        return { type: "h_line", origRow: r.h_line_row };
-      }
-    }
-    if (r.v_line_col !== undefined) {
-      const [vT, vB] = r.v_line_endpoints || [0, 0];
-      if (Math.abs(col - r.v_line_col) <= 6 && row >= vT - 10 && row <= vB + 10) {
-        return { type: "v_line", origCol: r.v_line_col };
       }
     }
 
@@ -921,6 +1189,40 @@
       }
     }
 
+    // Test geometric H line (orange, horizontal) — draggable vertically
+    if (r.h_line_row !== undefined && r.center_rc && r.radius_px) {
+      const [hcr, hcc] = r.center_rc;
+      const hr0 = r.radius_px;
+      const hRow = r.h_line_row;
+      const dyH = hRow - hcr;
+      const discH = hr0 * hr0 - dyH * dyH;
+      if (discH > 0) {
+        const sqH = Math.sqrt(discH);
+        const hLeft = hcc - sqH;
+        const hRight = hcc + sqH;
+        if (col >= hLeft - 6 && col <= hRight + 6 && Math.abs(row - hRow) <= 6) {
+          return { type: "h_line" };
+        }
+      }
+    }
+
+    // Test geometric V line (blue, vertical) — draggable horizontally
+    if (r.v_line_col !== undefined && r.center_rc && r.radius_px) {
+      const [vcr, vcc] = r.center_rc;
+      const vr0 = r.radius_px;
+      const vCol = r.v_line_col;
+      const dxV = vCol - vcc;
+      const discV = vr0 * vr0 - dxV * dxV;
+      if (discV > 0) {
+        const sqV = Math.sqrt(discV);
+        const vTop = vcr - sqV;
+        const vBottom = vcr + sqV;
+        if (row >= vTop - 6 && row <= vBottom + 6 && Math.abs(col - vCol) <= 6) {
+          return { type: "v_line" };
+        }
+      }
+    }
+
     return null;
   }
 
@@ -938,16 +1240,27 @@
 
     // Move the ROI based on type
     if (_dragState.type === "center") {
-      // Move phantom center → affects all ROIs
+      // Move phantom center -> affects all ROIs
       if (r.center_rc) {
         r.center_rc = [r.center_rc[0] + dr, r.center_rc[1] + dc];
       }
-    } else if (_dragState.type === "h_line") {
-      // Move horizontal measurement line up/down
-      r.h_line_row += dr;
-    } else if (_dragState.type === "v_line") {
-      // Move vertical measurement line left/right
-      r.v_line_col += dc;
+      // Also move H/V geometric lines with the center
+      if (r.h_line_row !== undefined) r.h_line_row += dr;
+      if (r.v_line_col !== undefined) r.v_line_col += dc;
+    } else if (_dragState.type === "lcd_anchor_outer" && r.lcd_anchor_outer_rc) {
+      r.lcd_anchor_outer_rc = [r.lcd_anchor_outer_rc[0] + dr, r.lcd_anchor_outer_rc[1] + dc];
+      if (r.center_rc) {
+        const [cr0, cc0] = r.center_rc;
+        const [ar, ac] = r.lcd_anchor_outer_rc;
+        const px = r.pixel_spacing_mm || AppState.slices?.[r.slice_idx ?? AppState.assignments[mod]]?.pixel_spacing_mm || 1;
+        const angle = Math.atan2(ac - cc0, -(ar - cr0)) * 180 / Math.PI;
+        const radiusMm = Math.hypot(ar - cr0, ac - cc0) * px;
+        const angleInput = document.getElementById("lcd-angle-offset");
+        const radiusInput = document.getElementById("lcd-ring-radius");
+        if (angleInput) angleInput.value = String(Math.max(-180, Math.min(180, angle)));
+        if (radiusInput) radiusInput.value = String(Math.max(15, Math.min(70, radiusMm)));
+        updateLcdControlValues(r);
+      }
     } else if (_dragState.type === "top_ramp_rect" && r.top_ramp_rect) {
       r.top_ramp_rect[0] += dr;
       r.top_ramp_rect[1] += dc;
@@ -972,6 +1285,12 @@
         roi.rect[0] += dr;
         roi.rect[1] += dc;
       }
+    } else if (_dragState.type === "h_line" && r.h_line_row !== undefined) {
+      // Move horizontal measurement line vertically only
+      r.h_line_row += dr;
+    } else if (_dragState.type === "v_line" && r.v_line_col !== undefined) {
+      // Move vertical measurement line horizontally only
+      r.v_line_col += dc;
     }
 
     // Redraw overlay with updated positions (immediate visual feedback)
@@ -986,9 +1305,6 @@
       let kwargs = null;
       if (r) {
         kwargs = {};
-        // Geometric: pass line positions
-        if (r.h_line_row !== undefined) kwargs.h_line_row = r.h_line_row;
-        if (r.v_line_col !== undefined) kwargs.v_line_col = r.v_line_col;
         // Slice thickness: pass ramp rects
         if (r.top_ramp_rect) kwargs.top_ramp_rect = r.top_ramp_rect;
         if (r.bot_ramp_rect) kwargs.bot_ramp_rect = r.bot_ramp_rect;
@@ -1010,17 +1326,32 @@
         }
         if (root?.lcd_slices) {
           kwargs.lcd_overrides = {};
+          const currentLcdAngle = parseFloat(document.getElementById("lcd-angle-offset")?.value || "0");
+          const currentLcdRadius = parseFloat(document.getElementById("lcd-ring-radius")?.value || "40");
+          const manualLcd = r.lcd_anchor_outer_rc ? {
+            center_rc: r.center_rc,
+            radius_px: r.radius_px,
+            lcd_angle_offset_deg: currentLcdAngle,
+            lcd_ring_radius_mm: currentLcdRadius,
+            lcd_anchor_outer_rc: r.lcd_anchor_outer_rc,
+            lcd_method: "cnr",
+          } : null;
           for (const sr of root.lcd_slices) {
-            kwargs.lcd_overrides[sr.slice_idx] = {
+            kwargs.lcd_overrides[sr.slice_idx] = manualLcd || {
               center_rc: sr.center_rc,
               radius_px: sr.radius_px,
-              lcd_angle_offset_deg: sr.lcd_angle_offset_deg,
-              lcd_ring_radius_mm: sr.lcd_ring_radius_mm,
+              lcd_angle_offset_deg: currentLcdAngle,
+              lcd_ring_radius_mm: currentLcdRadius,
+              lcd_anchor_outer_rc: sr.lcd_anchor_outer_rc,
+              lcd_method: "manual",
             };
           }
         }
         // Resolution: pass grid rects
         if (r.grid_rects) kwargs.grid_rects = r.grid_rects;
+        // Geometric: pass dragged H/V line positions
+        if (r.h_line_row !== undefined) kwargs.h_line_row = r.h_line_row;
+        if (r.v_line_col !== undefined) kwargs.v_line_col = r.v_line_col;
         // Common: center and radius
         if (r.center_rc) kwargs.center_rc = r.center_rc;
         if (r.radius_px) kwargs.radius_px = r.radius_px;
@@ -1047,16 +1378,19 @@
         kwargs = kwargs || {};
         if (!isNaN(angle)) kwargs.lcd_angle_offset_deg = angle;
         if (!isNaN(radius)) kwargs.lcd_ring_radius_mm = radius;
+        if (r?.lcd_anchor_outer_rc) {
+          kwargs.lcd_anchor_outer_rc = r.lcd_anchor_outer_rc;
+          kwargs.lcd_method = "cnr";
+        }
       }
       runAnalysis(mod, kwargs);
     }, 600);
   }
 
-  // ── Run Analysis with SNR multi-method support ─────────────────────────────
   async function runAnalysis(mod, extraKwargs = null) {
     const btn = document.getElementById("btn-run");
-    if (btn) { btn.disabled = true; btn.textContent = "⏳…"; }
-    UI.setStatus(`Analisi ${AppState.moduleLabels[mod]}…`);
+    if (btn) { btn.disabled = true; btn.textContent = "..."; }
+    UI.setStatus(`Analisi ${AppState.moduleLabels[mod]}...`);
     try {
       const activeIdxBefore = getActiveResult(mod)?.slice_idx;
       let kwargs = extraKwargs;
@@ -1078,9 +1412,14 @@
       if (mod === "low_contrast") {
         const angle = parseFloat(document.getElementById("lcd-angle-offset")?.value || "0");
         const radius = parseFloat(document.getElementById("lcd-ring-radius")?.value || "40");
+        const r = getActiveResult(mod);
         kwargs = kwargs || {};
         if (!isNaN(angle)) kwargs.lcd_angle_offset_deg = angle;
         if (!isNaN(radius)) kwargs.lcd_ring_radius_mm = radius;
+        if (r?.lcd_anchor_outer_rc) {
+          kwargs.lcd_anchor_outer_rc = r.lcd_anchor_outer_rc;
+          kwargs.lcd_method = "cnr";
+        }
       }
       const resp = await API.analyzeModule(mod, kwargs);
       AppState.results[mod] = resp;
@@ -1102,18 +1441,18 @@
         btn.disabled = false;
         btn.dataset.mode = "done";
       }
-      UI.setStatus(`✓ ${AppState.moduleLabels[mod]}`);
+      UI.setStatus(`OK ${AppState.moduleLabels[mod]}`);
     } catch (err) {
-      if (btn) { btn.disabled = false; btn.textContent = "⚡ Riprova"; }
+      if (btn) { btn.disabled = false; btn.textContent = "Riprova"; }
       document.getElementById("mod-results-area").innerHTML = `<div class="result-section" style="color:var(--accent-red)">Errore: ${err.message}</div>`;
-      UI.setStatus(`✗ ${err.message}`);
+      UI.setStatus(`ERR ${err.message}`);
     }
   }
 
-  // ── Render results with profile plots ──────────────────────────────────────
   function renderResults(mod, resp) {
     const area = document.getElementById("mod-results-area"); if (!area || !resp.results) return;
-    const r = resp.results;
+    const storedRoot = AppState.results[mod]?.results;
+    const r = (mod === "low_contrast" && storedRoot?.lcd_slices) ? storedRoot : resp.results;
     let html = "";
 
     if (mod === "psg") {
@@ -1122,8 +1461,8 @@
         <div class="summary-row info"><span class="summary-label">Segnale UFOV (S)</span><span class="summary-value">${UI.fmt(r.signal_mean,1)}</span></div>
         <div class="summary-row info"><span class="summary-label">S_Right / S_Left</span><span class="summary-value">${UI.fmt(r.s_right,1)} / ${UI.fmt(r.s_left,1)}</span></div>
         <div class="summary-row info"><span class="summary-label">S_Up / S_Down</span><span class="summary-value">${UI.fmt(r.s_up,1)} / ${UI.fmt(r.s_down,1)}</span></div>
-        <div class="summary-row info"><span class="summary-label">Limite ACR / AAPM</span><span class="summary-value">≤ 2.5% / ≤ 1.0%</span></div>
-        <div class="summary-row ${r.passed_aapm?'pass':'fail'}"><span class="summary-label">AAPM</span><span class="summary-value">${r.passed_aapm?'✓ PASS':'✗ FAIL'}</span></div>
+        <div class="summary-row info"><span class="summary-label">Limite ACR / AAPM</span><span class="summary-value"><= 2.5% / <= 1.0%</span></div>
+        <div class="summary-row ${r.passed_aapm?'pass':'fail'}"><span class="summary-label">AAPM</span><span class="summary-value">${r.passed_aapm?'OK PASS':'ERR FAIL'}</span></div>
       </div>`;
     } else if (mod === "piu") {
       html = `<div class="result-section">
@@ -1131,7 +1470,7 @@
         <div class="summary-row info"><span class="summary-label">S_max / S_min</span><span class="summary-value">${UI.fmt(r.s_max,1)} / ${UI.fmt(r.s_min,1)}</span></div>
         <div class="summary-row info"><span class="summary-label">Raggio UFOV</span><span class="summary-value">${Math.round((r.ufov_fraction||0.8)*100)}% (${r.ufov_radius_px||"-"} px)</span></div>
         <div class="summary-row info"><span class="summary-label">Ricerca max/min</span><span class="summary-value">interna alla ROI verde</span></div>
-        <div class="summary-row info"><span class="summary-label">Limite</span><span class="summary-value">≥ ${r.limit||87.5}%</span></div>
+        <div class="summary-row info"><span class="summary-label">Limite</span><span class="summary-value">>= ${r.limit||87.5}%</span></div>
       </div>`;
     } else if (mod === "snr") {
       const method = document.getElementById("snr-method")?.value || "single_lr";
@@ -1140,20 +1479,23 @@
       else if (method === "single_all") mainSnr = r.snr_all || r.snr;
       html = `<div class="result-section">
         <div class="summary-row pass"><span class="summary-label">SNR (metodo selezionato)</span><span class="summary-value" style="font-size:18px;color:var(--accent-yellow);">${UI.fmt(mainSnr,1)}</span></div>
-        <div class="summary-row info"><span class="summary-label">SNR (L+R) — Eq.7</span><span class="summary-value">${UI.fmt(r.snr_lr||r.snr,1)}</span></div>
+        <div class="summary-row info"><span class="summary-label">SNR (L+R) - Eq.7</span><span class="summary-value">${UI.fmt(r.snr_lr||r.snr,1)}</span></div>
         <div class="summary-row info"><span class="summary-label">SNR (U+D)</span><span class="summary-value">${UI.fmt(r.snr_ud,1)}</span></div>
         <div class="summary-row info"><span class="summary-label">SNR (all 4)</span><span class="summary-value">${UI.fmt(r.snr_all,1)}</span></div>
         <div class="summary-row info"><span class="summary-label">Segnale medio S</span><span class="summary-value">${UI.fmt(r.signal_mean,1)}</span></div>
-        <div class="summary-row info"><span class="summary-label">σ_L / σ_R</span><span class="summary-value">${UI.fmt(r.std_left,3)} / ${UI.fmt(r.std_right,3)}</span></div>
-        <div class="summary-row info"><span class="summary-label">σ_U / σ_D</span><span class="summary-value">${UI.fmt(r.std_up,3)} / ${UI.fmt(r.std_down,3)}</span></div>
-        ${r.method === "two_image_subtraction" ? `<div class="summary-row info"><span class="summary-label">σ_diff (subtraction)</span><span class="summary-value">${UI.fmt(r.sigma_diff,4)}</span></div>` : ""}
+        <div class="summary-row info"><span class="summary-label">sigma_L / sigma_R</span><span class="summary-value">${UI.fmt(r.std_left,3)} / ${UI.fmt(r.std_right,3)}</span></div>
+        <div class="summary-row info"><span class="summary-label">sigma_U / sigma_D</span><span class="summary-value">${UI.fmt(r.std_up,3)} / ${UI.fmt(r.std_down,3)}</span></div>
+        ${r.method === "two_image_subtraction" ? `<div class="summary-row info"><span class="summary-label">Immagini</span><span class="summary-value">#${r.primary_slice_idx} / #${r.second_slice_idx}</span></div>` : ""}
+        ${r.method === "two_image_subtraction" ? `<div class="summary-row info"><span class="summary-label">Posizioni z</span><span class="summary-value">${UI.fmt(r.primary_slice_location,2)} / ${UI.fmt(r.second_slice_location,2)}</span></div>` : ""}
+        ${r.method === "two_image_subtraction" ? `<div class="summary-row info"><span class="summary-label">sigma_diff (subtraction)</span><span class="summary-value">${UI.fmt(r.sigma_diff,4)}</span></div>` : ""}
+        ${r.method === "two_image_subtraction" ? `<div class="summary-row info"><span class="summary-label">Media |diff|</span><span class="summary-value">${UI.fmt(r.diff_mean_abs,4)}</span></div>` : ""}
         <div class="summary-row info"><span class="summary-label">Metodo</span><span class="summary-value">${r.method||"single image NEMA"}</span></div>
       </div>
       <div class="result-section"><h4>Confronto metodi SNR (articolo)</h4>
         <table class="result-table"><thead><tr><th>Metodo</th><th>SNR</th><th>Ref.</th></tr></thead><tbody>
-          <tr><td>A) Single — σ(L+R)</td><td style="font-weight:700">${UI.fmt(r.snr_lr||r.snr,1)}</td><td>Eq.7</td></tr>
-          <tr><td>A) Single — σ(U+D)</td><td>${UI.fmt(r.snr_ud,1)}</td><td>—</td></tr>
-          <tr><td>A) Single — σ(all 4)</td><td>${UI.fmt(r.snr_all,1)}</td><td>—</td></tr>
+          <tr><td>A) Single - sigma(L+R)</td><td style="font-weight:700">${UI.fmt(r.snr_lr||r.snr,1)}</td><td>Eq.7</td></tr>
+          <tr><td>A) Single - sigma(U+D)</td><td>${UI.fmt(r.snr_ud,1)}</td><td>-</td></tr>
+          <tr><td>A) Single - sigma(all 4)</td><td>${UI.fmt(r.snr_all,1)}</td><td>-</td></tr>
           ${r.method === "two_image_subtraction" ? `<tr><td>C) Two-image subtraction</td><td style="font-weight:700;color:var(--accent-cyan)">${UI.fmt(r.snr,1)}</td><td>Eq.6</td></tr>` : ""}
         </tbody></table>
       </div>`;
@@ -1161,11 +1503,11 @@
       html = `<div class="result-section">
         <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">SNRU</span><span class="summary-value">${UI.fmt(r.snru_percent,2)}%</span></div>
         <div class="summary-row info"><span class="summary-label">SNR medio</span><span class="summary-value">${UI.fmt(r.snr_mean,1)}</span></div>
-        <div class="summary-row info"><span class="summary-label">σ SNR</span><span class="summary-value">${UI.fmt(r.snr_std,3)}</span></div>
-        <div class="summary-row info"><span class="summary-label">Limite achievable / acceptable</span><span class="summary-value">≤ 5% / ≤ 10%</span></div>
+        <div class="summary-row info"><span class="summary-label">sigma SNR</span><span class="summary-value">${UI.fmt(r.snr_std,3)}</span></div>
+        <div class="summary-row info"><span class="summary-label">Limite achievable / acceptable</span><span class="summary-value"><= 5% / <= 10%</span></div>
       </div>`;
       if (r.rois && r.rois.length > 0) {
-        html += `<div class="result-section"><h4>ROI SNR (5 posizioni)</h4><table class="result-table"><thead><tr><th>Posizione</th><th>Media</th><th>σ</th><th>SNR</th></tr></thead><tbody>`;
+        html += `<div class="result-section"><h4>ROI SNR (5 posizioni)</h4><table class="result-table"><thead><tr><th>Posizione</th><th>Media</th><th>sigma</th><th>SNR</th></tr></thead><tbody>`;
         for (const roi of r.rois) html += `<tr><td>${roi.name}</td><td>${UI.fmt(roi.mean_val,1)}</td><td>${UI.fmt(roi.std_val,2)}</td><td style="font-weight:700">${UI.fmt(roi.snr,1)}</td></tr>`;
         html += `</tbody></table></div>`;
         // Bar chart of SNR values
@@ -1177,9 +1519,19 @@
       const d135 = gp.diagonal_135?.diameter_mm;
       html = `<div class="result-section">
         <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">Geometria</span><span class="summary-value">${UI.passIcon(r.passed)}</span></div>
+        <div class="summary-row info"><span class="summary-label">Slice / misura</span><span class="summary-value">#${r.slice_idx ?? AppState.assignments[mod]} - ${r.geometric_slice_mode || "profilo"}</span></div>
         <div class="summary-row info"><span class="summary-label">Diametro H / V</span><span class="summary-value">${UI.fmt(r.diameter_h_mm,2)} / ${UI.fmt(r.diameter_v_mm,2)} mm</span></div>
         <div class="summary-row info"><span class="summary-label">Nominale</span><span class="summary-value">${r.nominal_diameter_mm||190} mm</span></div>
+        <div class="summary-row info"><span class="summary-label">Riferimento</span><span class="summary-value">${r.geometry_reference || "diametro interno phantom"}</span></div>
         <div class="summary-row info"><span class="summary-label">Oblique 45 / 135</span><span class="summary-value">${d45 !== undefined ? UI.fmt(d45,2) : "-"} / ${d135 !== undefined ? UI.fmt(d135,2) : "-"} mm</span></div>
+        <div class="summary-row info"><span class="summary-label">Centro scuro / acqua</span><span class="summary-value">${r.central_dark_ratio !== undefined ? UI.fmt(r.central_dark_ratio,3) : "-"}</span></div>
+      </div>
+      <div class="result-section">
+        <h4>Distorsione Geometrica (Grid)</h4>
+        <div class="summary-row info"><span class="summary-label">Punti rilevati</span><span class="summary-value">${r.grid_distortion ? r.grid_distortion.n_dots_detected : (r.grid_dots ? r.grid_dots.length : 0)}</span></div>
+        ${r.grid_distortion ? `<div class="summary-row info"><span class="summary-label">Spaziatura mediana</span><span class="summary-value">${UI.fmt(r.grid_distortion.median_spacing_mm, 2)} mm</span></div>
+        <div class="summary-row info"><span class="summary-label">Dev. std spaziatura</span><span class="summary-value">${UI.fmt(r.grid_distortion.spacing_std_mm, 2)} mm</span></div>
+        <div class="summary-row info"><span class="summary-label">Max deviazione</span><span class="summary-value">${UI.fmt(r.grid_distortion.max_spacing_deviation_mm, 2)} mm</span></div>` : '<div class="summary-row info"><span class="summary-label">Stato</span><span class="summary-value">Griglia non rilevata su questa slice</span></div>'}
       </div>
       <div class="result-section">
         <h4>Profili lineari ROI</h4>
@@ -1220,8 +1572,9 @@
       }
     } else if (mod === "resolution") {
       html = `<div class="result-section">
-        <div class="summary-row info"><span class="summary-label">Modalita</span><span class="summary-value">assistita MIP + picchi</span></div>
-        <div class="summary-row info"><span class="summary-label">Valutazione</span><span class="summary-value">manuale sui picchi H/V</span></div>
+        <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">Risoluzione</span><span class="summary-value">${r.resolved_mm ?? "-"} mm</span></div>
+        <div class="summary-row info"><span class="summary-label">Modalita</span><span class="summary-value">profili riga/colonna assistiti</span></div>
+        <div class="summary-row info"><span class="summary-label">Criterio</span><span class="summary-value">una riga o colonna con 4 picchi</span></div>
       </div>`;
       if (r.grid_rects && r.grid_rects.length > 0) {
         const labels = ["1.1 mm", "1.0 mm", "0.9 mm"];
@@ -1232,17 +1585,20 @@
           const checked = manualTicks[labels[i]] === true;
           html += `<label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;"><input type="checkbox" class="resolution-manual-tick" data-target="${labels[i]}" ${checked ? "checked" : ""}>${labels[i]}</label>`;
         }
-        html += `</div><table class="result-table"><thead><tr><th>Target</th><th>ROI y,x,h,w</th><th>Picchi H/V</th><th>Mod.</th></tr></thead><tbody>`;
+        html += `</div><table class="result-table"><thead><tr><th>Target</th><th>ROI y,x,h,w</th><th>Linea H/V</th><th>MIP H/V</th><th>Esito</th></tr></thead><tbody>`;
         for (let i = 0; i < r.grid_rects.length; i++) {
           const mip = r.resolution_mip?.[i];
+          const line = r.resolution_line_profiles?.[i];
           const hc = mip?.horizontal?.count ?? 0;
           const vc = mip?.vertical?.count ?? 0;
-          html += `<tr><td>${labels[i]}</td><td>${r.grid_rects[i].join(", ")}</td><td>${hc} / ${vc}</td><td>${UI.fmt(mods[i],4)}</td></tr>`;
+          const lh = line?.best_horizontal_count ?? 0;
+          const lv = line?.best_vertical_count ?? 0;
+          html += `<tr><td>${labels[i]}</td><td>${r.grid_rects[i].join(", ")}</td><td style="font-weight:700">${lh} / ${lv}</td><td>${hc} / ${vc}</td><td>${UI.passIcon(line?.resolved)}</td></tr>`;
         }
         html += `</tbody></table></div>`;
       }
       if (r.resolution_mip && r.resolution_mip.length > 0) {
-        html += `<div class="result-section"><h4>Profili MIP H / V</h4>`;
+        html += `<div class="result-section"><h4>Profili lineari H / V</h4>`;
         for (let i = 0; i < r.resolution_mip.length; i++) {
           const target = r.resolution_mip[i].target_mm;
           html += `<div style="font-size:12px;font-weight:600;color:var(--text-secondary);margin:12px 0 4px;">${target.toFixed(1)} mm</div>
@@ -1252,7 +1608,7 @@
       }
     } else if (false && mod === "resolution") {
       html = `<div class="result-section">
-        <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">Risoluzione</span><span class="summary-value">${r.resolved_mm||"—"} mm</span></div>
+        <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">Risoluzione</span><span class="summary-value">${r.resolved_mm||"-"} mm</span></div>
       </div>`;
       if (r.grid_rects && r.grid_rects.length > 0) {
         const labels = ["1.1 mm", "1.0 mm", "0.9 mm"];
@@ -1267,16 +1623,22 @@
     } else if (mod === "low_contrast") {
       html = `<div class="result-section">
         <div class="summary-row ${r.passed?'pass':'fail'}"><span class="summary-label">LCD totale slice 8-11</span><span class="summary-value">${r.lcd_total_visible ?? r.n_visible ?? 0} / ${r.lcd_total_possible ?? r.n_total ?? "?"}</span></div>
-        <div class="summary-row info"><span class="summary-label">Geometria spoke</span><span class="summary-value">${UI.fmt(r.lcd_ring_radius_mm,1)} mm, ${UI.fmt(r.lcd_angle_offset_deg,1)}°</span></div>
-        <div class="summary-row info"><span class="summary-label">Ancora automatica</span><span class="summary-value">slice ${r.lcd_anchor_slice ?? 11}: ${UI.fmt(r.lcd_anchor_ring_radius_mm,1)} mm, ${UI.fmt(r.lcd_anchor_angle_offset_deg,1)}°</span></div>
+        <div class="summary-row info"><span class="summary-label">Geometria spoke</span><span class="summary-value">${UI.fmt(r.lcd_ring_radius_mm,1)} mm, ${UI.fmt(r.lcd_angle_offset_deg,1)} deg</span></div>
+        <div class="summary-row info"><span class="summary-label">Anello LCD rilevato</span><span class="summary-value">${r.lcd_annulus_radius_mm !== undefined && r.lcd_annulus_radius_mm !== null ? UI.fmt(r.lcd_annulus_radius_mm,1) + " mm" : "-"}</span></div>
+        <div class="summary-row info"><span class="summary-label">Raggi oggetti</span><span class="summary-value">${(r.lcd_disk_radii_mm||[]).map(v => UI.fmt(v,1)).join(" / ")} mm</span></div>
+        <div class="summary-row info"><span class="summary-label">Ancora automatica</span><span class="summary-value">slice ${r.lcd_anchor_slice ?? 11}: ${UI.fmt(r.lcd_anchor_ring_radius_mm,1)} mm, ${UI.fmt(r.lcd_anchor_angle_offset_deg,1)} deg</span></div>
         <div class="summary-row info"><span class="summary-label">Soglia auto CNR</span><span class="summary-value">${UI.fmt(r.lcd_visibility_cnr_threshold,2)}</span></div>
         <div class="summary-row ${r.passed_t1?'pass':'fail'}"><span class="summary-label">Limite ACR T1</span><span class="summary-value">${r.lcd_limit_t1 ?? "-"} spoke</span></div>
         <div class="summary-row ${r.passed_t2?'pass':'fail'}"><span class="summary-label">Limite ACR T2</span><span class="summary-value">${r.lcd_limit_t2 ?? "-"} spoke</span></div>
       </div>`;
       if (r.lcd_slices) {
-        html += `<div class="result-section"><h4>Conteggio per slice</h4><div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;">`;
+        const activeSliceIdx = getActiveResult(mod)?.slice_idx ?? r.slice_idx;
+        html += `<div class="result-section"><h4>Conteggio per slice</h4>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">
+            <button class="btn btn-xs btn-secondary lcd-nav-btn" data-dir="-1">Indietro</button>
+            <button class="btn btn-xs btn-secondary lcd-nav-btn" data-dir="1">Avanti</button>`;
         for (const sr of r.lcd_slices) {
-          html += `<button class="btn btn-xs btn-secondary slice-view-btn" data-module="low_contrast" data-idx="${sr.slice_idx}">Slice ${sr.slice_number_acr}</button>`;
+          html += `<button class="btn btn-xs btn-secondary slice-view-btn ${sr.slice_idx === activeSliceIdx ? "active" : ""}" data-module="low_contrast" data-idx="${sr.slice_idx}">Slice ${sr.slice_number_acr}</button>`;
         }
         html += `</div><table class="result-table"><thead><tr><th>Slice</th><th>Contrasto</th><th>Spoke</th><th>Oggetti</th></tr></thead><tbody>`;
         const contrasts = {8:"1.4%",9:"2.5%",10:"3.6%",11:"5.1%"};
@@ -1302,6 +1664,17 @@
         const list = root?.slice_position_slices || root?.lcd_slices || [];
         const target = list.find(x => String(x.slice_idx) === btn.dataset.idx);
         showResultView(mod, target || root);
+      });
+    }
+    for (const btn of area.querySelectorAll(".lcd-nav-btn")) {
+      btn.addEventListener("click", () => {
+        const root = AppState.results[mod]?.results;
+        const list = root?.lcd_slices || [];
+        if (!list.length) return;
+        const activeIdx = getActiveResult(mod)?.slice_idx ?? root.slice_idx;
+        const current = Math.max(0, list.findIndex(x => x.slice_idx === activeIdx));
+        const next = Math.max(0, Math.min(list.length - 1, current + parseInt(btn.dataset.dir || "0", 10)));
+        showResultView(mod, list[next]);
       });
     }
     if (mod === "resolution") {
@@ -1396,11 +1769,13 @@
       const canvas = document.getElementById(`resolution-mip-${i}`);
       if (!canvas) continue;
       const item = r.resolution_mip[i];
+      const lineItem = r.resolution_line_profiles?.[i];
       const ctx = canvas.getContext("2d");
       const W = canvas.width, H = canvas.height;
       const pad = { l: 34, r: 12, t: 14, b: 24 };
-      const hProf = item.horizontal || {};
-      const vProf = item.vertical || {};
+      const pickBest = (profiles = []) => profiles.reduce((best, p) => !best || (p.count || 0) > (best.count || 0) ? p : best, null);
+      const hProf = pickBest(lineItem?.horizontal_profiles) || item.horizontal || {};
+      const vProf = pickBest(lineItem?.vertical_profiles) || item.vertical || {};
       const series = [
         { label: "H", color: "#f97316", data: hProf.values || [], smooth: hProf.smoothed || [], peaks: hProf.peaks || [], threshold: hProf.threshold },
         { label: "V", color: "#3b82f6", data: vProf.values || [], smooth: vProf.smoothed || [], peaks: vProf.peaks || [], threshold: vProf.threshold },
@@ -1576,38 +1951,225 @@
 
   // Analyze All
   document.getElementById("btn-analyze-all").addEventListener("click", async () => {
-    UI.setStatus("Analisi tutti i moduli…");
+    UI.setStatus("Analisi tutti i moduli...");
     try {
       const resp = await API.analyzeAll();
       for (const [mod, data] of Object.entries(resp.results || {})) { AppState.results[mod] = data; const ts = document.getElementById(`ts-${mod}`); if (ts) ts.className = `tab-status ${data.results?.passed === false ? "fail" : "pass"}`; }
-      UI.setStatus("✓ Completata"); const at = document.querySelector(".tab-btn.active"); if (at) showModule(at.dataset.module);
-    } catch (e) { UI.setStatus(`✗ ${e.message}`); }
+      UI.setStatus("OK Completata"); const at = document.querySelector(".tab-btn.active"); if (at) showModule(at.dataset.module);
+    } catch (e) { UI.setStatus(`ERR ${e.message}`); }
   });
   document.getElementById("btn-go-report").addEventListener("click", () => { setupStep5(); UI.showStep(5); });
 
-  // ═══════════════════════════════════════════════════════════════════════════
   // STEP 5: Report
-  // ═══════════════════════════════════════════════════════════════════════════
-  function setupStep5() {
-    const c = document.getElementById("report-container"); c.innerHTML = "";
-    const allP = Object.values(AppState.results).every(r => r.results?.passed !== false);
-    const hdr = document.createElement("div"); hdr.className = "report-card"; hdr.style.gridColumn = "1/-1";
-    hdr.innerHTML = `<div class="report-card-header"><h3>Report QC MRI — ACR</h3><span class="status-badge ${allP?'pass':'fail'}">${allP?'✓ CONFORME':'✗ NON CONFORME'}</span></div>
-      <div class="report-kv-grid"><div class="kv-item"><span class="kv-lbl">Data</span><span class="kv-val">${AppState.metaInfo.data_controllo||"—"}</span></div>
-      <div class="kv-item"><span class="kv-lbl">Presidio</span><span class="kv-val">${AppState.metaInfo.presidio||"—"}</span></div>
-      <div class="kv-item"><span class="kv-lbl">Sala</span><span class="kv-val">${AppState.metaInfo.sala||"—"}</span></div>
-      <div class="kv-item"><span class="kv-lbl">Scanner</span><span class="kv-val">${AppState.dicomMeta?.manufacturer||""} ${AppState.dicomMeta?.model||""} ${AppState.dicomMeta?.magnetic_field_T||""}T</span></div></div>`;
-    c.appendChild(hdr);
-    for (const mod of AppState.moduleOrder) {
-      if (!AppState.results[mod]) continue;
-      const d = AppState.results[mod], r = d.results||{};
-      const card = document.createElement("div"); card.className = "report-card";
-      let val = r.psg_percent !== undefined ? `${UI.fmt(r.psg_percent,4)}%` : r.piu_percent !== undefined ? `${UI.fmt(r.piu_percent,2)}%` : r.snr !== undefined ? `SNR=${UI.fmt(r.snr,1)}` : r.snru_percent !== undefined ? `${UI.fmt(r.snru_percent,2)}%` : r.passed !== undefined ? (r.passed?"PASS":"FAIL") : "—";
-      card.innerHTML = `<div class="report-card-header"><h3>${AppState.moduleLabels[mod]}</h3><span class="status-badge ${r.passed===false?'fail':'pass'}">${r.passed===false?'✗ FAIL':'✓ PASS'}</span></div>
-        <div class="report-kv-grid"><div class="kv-item"><span class="kv-lbl">Risultato</span><span class="kv-val">${val}</span></div></div>
-        ${d.overlay_image?`<img src="data:image/png;base64,${d.overlay_image}" style="width:100%;border-radius:6px;margin-top:8px;"/>`:""}`;
-      c.appendChild(card);
+  function reportStatus(passed) {
+    return `<span class="report-pill ${passed === false ? "fail" : "pass"}">${passed === false ? "FAIL" : "PASS"}</span>`;
+  }
+
+  function esc(value) {
+    return String(value ?? "-").replace(/[&<>"']/g, ch => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+    }[ch]));
+  }
+
+  function metric(label, value, cls = "") {
+    return `<div class="report-metric ${cls}"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`;
+  }
+
+  function resultValue(mod, r) {
+    if (mod === "geometric") return `${UI.fmt(r.diameter_h_mm, 1)} / ${UI.fmt(r.diameter_v_mm, 1)} mm`;
+    if (mod === "resolution") return r.resolved_mm ? `${r.resolved_mm} mm` : "Non risolta";
+    if (mod === "slice_thickness") return `${UI.fmt(r.measured_thickness_mm, 2)} mm`;
+    if (mod === "slice_position") return `${UI.fmt(r.slice_position_max_abs_error_mm ?? Math.abs(r.slice_position_error_mm), 2)} mm`;
+    if (mod === "piu") return `${UI.fmt(r.piu_percent, 2)}%`;
+    if (mod === "psg") return `${UI.fmt(r.psg_percent, 4)}%`;
+    if (mod === "low_contrast") return `${r.lcd_total_visible ?? r.n_visible ?? 0} / ${r.lcd_total_possible ?? r.n_total ?? "?"}`;
+    if (mod === "snr") return `${UI.fmt(r.snr, 1)}`;
+    if (mod === "snru") return `${UI.fmt(r.snru_percent, 2)}%`;
+    return r.passed === false ? "FAIL" : "PASS";
+  }
+
+  function reportDetails(mod, r) {
+    if (mod === "resolution") {
+      const rows = (r.resolution_line_profiles || []).map(x =>
+        `<tr><td>${x.target_mm.toFixed(1)} mm</td><td>${x.best_horizontal_count} / ${x.best_vertical_count}</td><td>${x.resolved ? "risolto" : "non risolto"}</td></tr>`
+      ).join("");
+      return `<table class="report-mini-table"><thead><tr><th>Target</th><th>Linea H/V</th><th>Esito</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
+    if (mod === "low_contrast" && r.lcd_slices) {
+      const contrast = {8:"1.4%",9:"2.5%",10:"3.6%",11:"5.1%"};
+      return `<table class="report-mini-table"><thead><tr><th>Slice</th><th>Contrasto</th><th>Spoke</th></tr></thead><tbody>${r.lcd_slices.map(s => `<tr><td>${s.slice_number_acr}</td><td>${contrast[s.slice_number_acr] || "-"}</td><td>${s.n_visible}/${s.n_total}</td></tr>`).join("")}</tbody></table>`;
+    }
+    if (mod === "snr" && r.method === "two_image_subtraction") {
+      return `<div class="report-detail-grid">${metric("Metodo", "two-image subtraction")}${metric("Immagini", `#${r.primary_slice_idx} / #${r.second_slice_idx}`)}${metric("sigma diff", UI.fmt(r.sigma_diff, 4))}${metric("Media |diff|", UI.fmt(r.diff_mean_abs, 4))}</div>`;
+    }
+    if (mod === "slice_position" && r.slice_position_slices) {
+      return `<table class="report-mini-table"><thead><tr><th>Slice</th><th>Errore</th><th>Esito</th></tr></thead><tbody>${r.slice_position_slices.map(s => `<tr><td>${s.slice_number_acr}</td><td>${UI.fmt(s.slice_position_error_mm, 2)} mm</td><td>${s.passed ? "PASS" : "FAIL"}</td></tr>`).join("")}</tbody></table>`;
+    }
+    return "";
+  }
+
+  function setupStep5() {
+    const actions = document.querySelector("#step-5 .panel-actions");
+    let printBtn = document.getElementById("btn-print-report");
+    if (!printBtn && actions) {
+      printBtn = document.createElement("button");
+      printBtn.id = "btn-print-report";
+      printBtn.className = "btn btn-secondary";
+      printBtn.textContent = "Stampa / PDF";
+      actions.prepend(printBtn);
+    }
+    let saveBtn = document.getElementById("btn-save-session");
+    if (!saveBtn && actions) {
+      saveBtn = document.createElement("button");
+      saveBtn.id = "btn-save-session";
+      saveBtn.className = "btn btn-secondary";
+      saveBtn.textContent = "Salva JSON";
+      saveBtn.style.marginLeft = "6px";
+      actions.prepend(saveBtn);
+    }
+    if (printBtn) printBtn.onclick = () => window.print();
+    if (saveBtn) saveBtn.onclick = async () => {
+      try {
+        const resp = await fetch(`${API._base}/save-session`, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filepath:""})});
+        const data = await resp.json();
+        if (data.success) alert(`Sessione salvata:\n${data.filepath}`);
+        else alert("Errore salvataggio");
+      } catch(e) { alert("Errore: " + e.message); }
+    };
+
+    const c = document.getElementById("report-container");
+    c.innerHTML = "";
+    const completed = Object.keys(AppState.results).length;
+    const allP = completed > 0 && Object.values(AppState.results).every(r => r.results?.passed !== false);
+    const meta = AppState.dicomMeta || {};
+
+    // ========== HEADER ==========
+    const header = document.createElement("section");
+    header.className = "print-report-cover";
+    header.innerHTML = `
+      <div class="report-cover-main" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <h1 style="margin:0;font-size:20px;">Report QC MRI — Phantom ACR</h1>
+        <div class="report-outcome ${allP ? "pass" : "fail"}" style="font-size:14px;font-weight:bold;padding:4px 12px;border-radius:4px;">${allP ? "CONFORME" : "NON CONFORME"}</div>
+      </div>
+      <table class="report-table" style="width:100%;margin-bottom:12px;">
+        <tbody>
+          <tr><td style="width:25%"><strong>Data</strong></td><td>${esc(AppState.metaInfo.data_controllo || "-")}</td>
+              <td style="width:25%"><strong>Tipo</strong></td><td>${esc(AppState.metaInfo.tipo_controllo || "-")}</td></tr>
+          <tr><td><strong>Presidio</strong></td><td>${esc(AppState.metaInfo.presidio || "-")}</td>
+              <td><strong>Sala</strong></td><td>${esc(AppState.metaInfo.sala || "-")}</td></tr>
+          <tr><td><strong>Sistema</strong></td><td>${esc(`${meta.manufacturer || ""} ${meta.model || ""}`.trim() || "-")}</td>
+              <td><strong>Campo</strong></td><td>${meta.magnetic_field_T ? meta.magnetic_field_T + " T" : "-"}</td></tr>
+          <tr><td><strong>Protocollo</strong></td><td>${esc(meta.protocol || meta.series_description || "-")}</td>
+              <td><strong>TR/TE</strong></td><td>${meta.tr_ms ? meta.tr_ms + " / " + meta.te_ms + " ms" : "-"}</td></tr>
+          <tr><td><strong>Operatori</strong></td><td>${esc(AppState.metaInfo.operatori || "-")}</td>
+              <td><strong>Data studio</strong></td><td>${esc(meta.study_date || "-")}</td></tr>
+        </tbody>
+      </table>
+      ${AppState.metaInfo.note ? `<p style="font-size:11px;color:var(--text-muted);"><strong>Note:</strong> ${esc(AppState.metaInfo.note)}</p>` : ""}`;
+    c.appendChild(header);
+
+    // ========== TABELLA RIEPILOGO ==========
+    const completedMods = AppState.moduleOrder.filter(m => AppState.results[m]);
+    if (completedMods.length > 0) {
+      const summarySection = document.createElement("section");
+      summarySection.className = "print-report-section";
+      let tableRows = completedMods.map(mod => {
+        const d = AppState.results[mod], r = d.results || {};
+        const passClass = r.passed === false ? "fail" : "pass";
+        const passText = r.passed === false ? "FAIL" : "PASS";
+        return `<tr class="${passClass}">
+          <td><strong>${AppState.moduleLabels[mod]}</strong></td>
+          <td>${resultValue(mod, r)}</td>
+          <td style="text-align:center"><span class="report-pill ${passClass}">${passText}</span></td>
+          <td>${d.slice_info?.idx !== undefined ? "#" + d.slice_info.idx : "-"}</td>
+        </tr>`;
+      }).join("");
+      summarySection.innerHTML = `
+        <h2 style="font-size:15px;margin-bottom:8px;">Risultati</h2>
+        <table class="report-table report-results-table">
+          <thead><tr><th>Parametro</th><th>Valore</th><th>Esito</th><th>Slice</th></tr></thead>
+          <tbody>${tableRows}</tbody>
+        </table>`;
+      c.appendChild(summarySection);
+
+      // ========== DETTAGLI PER MODULO (tabelle compatte) ==========
+      for (const mod of completedMods) {
+        const d = AppState.results[mod], r = d.results || {};
+        const detail = reportDetails(mod, r);
+        if (detail) {
+          const detailSection = document.createElement("div");
+          detailSection.style.cssText = "margin:8px 0;padding:6px 0;border-top:1px solid var(--border);";
+          detailSection.innerHTML = `<h4 style="font-size:12px;margin:0 0 4px 0;color:var(--text-muted);">${AppState.moduleLabels[mod]} — Dettaglio</h4>${detail}`;
+          c.appendChild(detailSection);
+        }
+      }
+
+      // ========== IMMAGINI IN FONDO ==========
+      const imagesSection = document.createElement("section");
+      imagesSection.className = "print-report-section";
+      imagesSection.innerHTML = `<h2 style="font-size:15px;margin-bottom:8px;page-break-before:always;">Immagini ROI</h2>`;
+      let hasImages = false;
+      const imgGrid = document.createElement("div");
+      imgGrid.style.cssText = "display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px;";
+      for (const mod of completedMods) {
+        const d = AppState.results[mod];
+        if (d.overlay_image) {
+          hasImages = true;
+          const fig = document.createElement("figure");
+          fig.style.cssText = "margin:0;text-align:center;";
+          fig.innerHTML = `<img src="data:image/png;base64,${d.overlay_image}" style="width:100%;max-width:280px;border-radius:4px;border:1px solid var(--border);"/>
+            <figcaption style="font-size:10px;color:var(--text-muted);margin-top:2px;">${AppState.moduleLabels[mod]}</figcaption>`;
+          imgGrid.appendChild(fig);
+        }
+      }
+      if (hasImages) {
+        imagesSection.appendChild(imgGrid);
+        c.appendChild(imagesSection);
+      }
+    }
+
+    // ========== FOOTER: ESITO + FIRME ==========
+    const footer = document.createElement("section");
+    footer.className = "print-report-section report-footer-signatures";
+    footer.style.cssText = "page-break-before:always;";
+    footer.innerHTML = `
+      <div style="margin-bottom:24px;">
+        <p style="font-size:13px;font-weight:bold;margin-bottom:10px;">ESITO DELLA PROVA:</p>
+        <div style="margin-left:20px;font-size:12px;line-height:2.2;">
+          <label><input type="checkbox" style="margin-right:6px;" ${allP ? 'checked' : ''}>entro i limiti di tolleranza</label><br>
+          <label><input type="checkbox" style="margin-right:6px;" ${(!allP && completed > 0) ? 'checked' : ''}>entro i limiti di tolleranza con esclusione dei parametri evidenziati</label>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-top:20px;padding-top:12px;border-top:1px dashed #94a3b8;">
+        <div style="font-size:12px;">
+          <p>Data: ___________________</p>
+        </div>
+        <div style="text-align:right;font-size:11px;max-width:55%;">
+          <p style="margin-bottom:30px;">L'Esperto Responsabile della Sicurezza in RM</p>
+          <p style="border-top:1px solid #333;padding-top:4px;">Firma</p>
+        </div>
+      </div>
+
+      <div style="margin-top:40px;padding-top:20px;border-top:2px dashed #94a3b8;">
+        <p style="font-size:13px;font-weight:bold;margin-bottom:10px;">GIUDIZIO DI IDONEITA' ALL'IMPIEGO CLINICO:</p>
+        <div style="margin-left:20px;font-size:12px;line-height:2.2;">
+          <label><input type="checkbox" style="margin-right:6px;" ${allP ? 'checked' : ''}>idoneo</label><br>
+          <label><input type="checkbox" style="margin-right:6px;" ${(!allP && completed > 0) ? 'checked' : ''}>non idoneo</label><br>
+          <label><input type="checkbox" style="margin-right:6px;">idoneo con le seguenti restrizioni di impiego:</label>
+          <div style="border-bottom:1px solid #ccc;min-height:20px;margin:4px 0 8px 24px;"></div>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-top:20px;padding-top:12px;border-top:1px dashed #94a3b8;">
+        <div style="font-size:12px;">
+          <p>Data: ___________________</p>
+        </div>
+        <div style="text-align:right;font-size:11px;max-width:55%;">
+          <p style="margin-bottom:30px;">Il Medico Radiologo Responsabile della Sicurezza Clinica<br>e dell'Efficacia Diagnostica dell'apparecchiatura RM</p>
+          <p style="border-top:1px solid #333;padding-top:4px;">Firma</p>
+        </div>
+      </div>
+    `;
+    c.appendChild(footer);
   }
   document.getElementById("btn-new-analysis").addEventListener("click", () => { AppState.reset(); UI.showStep(1); UI.setStatus("Pronto"); });
 

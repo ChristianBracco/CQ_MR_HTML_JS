@@ -40,7 +40,7 @@ const AppState = {
   // Default slice assignments for ACR phantom (0-indexed)
   // Multiple modules CAN share the same slice
   defaultSlices: {
-    geometric: 0,        // Slice 1
+    geometric: 4,        // Slice 5 / index #4: geometric distortion insert
     resolution: 0,       // Slice 1
     slice_thickness: 0,  // Slice 1
     slice_position: 0,   // Slice 1
@@ -53,6 +53,7 @@ const AppState = {
 
   // Assignments: module -> slice index
   assignments: {},
+  suggestedAssignments: {},
   activeModule: null,
 
   // WL/WW
@@ -76,6 +77,7 @@ const AppState = {
     this.slices = [];
     this.thumbnails = [];
     this.assignments = {};
+    this.suggestedAssignments = {};
     this.activeModule = null;
     this.results = {};
     this.dicomMeta = null;

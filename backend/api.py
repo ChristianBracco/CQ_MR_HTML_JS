@@ -20,6 +20,7 @@ import os
 import sys
 import base64
 import traceback
+import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -83,6 +84,7 @@ from roi_tools import (
     calculate_slice_position,
     calculate_spatial_resolution,
     calculate_low_contrast,
+    calculate_relaxometry,
 )
 
 # Serve frontend static files
@@ -141,11 +143,14 @@ class AppState:
         self.reset()
 
     def reset(self):
-        self.slices: List[DicomSlice] = []
+        self.all_slices: List[DicomSlice] = []  # ALL loaded slices across sequences
+        self.slices: List[DicomSlice] = []       # Active sequence slices
+        self.active_sequence_uid: str = ""
         self.input_dir: str = ""
         self.assigned_slices: Dict[str, int] = {}  # module -> slice index
         self.results: Dict[str, dict] = {}
         self.meta_info: dict = {}
+        self.all_results: Dict[str, Dict[str, dict]] = {}  # uid -> {module -> result}
 
 
 state = AppState()
@@ -173,6 +178,7 @@ MODULE_ORDER = ["geometric", "resolution", "slice_thickness", "slice_position",
 
 class LoadRequest(BaseModel):
     input_dir: str
+    recursive: bool = True
 
 class ManualAssignRequest(BaseModel):
     assignments: Dict[str, int]
@@ -190,6 +196,18 @@ class MetaInfoRequest(BaseModel):
     note: str = ""
 
 
+class SaveSessionRequest(BaseModel):
+    filepath: str = ""
+
+
+class LoadSessionRequest(BaseModel):
+    filepath: str
+
+
+class SetActiveSequenceRequest(BaseModel):
+    uid: str
+
+
 def _valid_slice_indices(base_idx: int, offsets: List[int]) -> List[int]:
     indices = []
     for off in offsets:
@@ -197,6 +215,88 @@ def _valid_slice_indices(base_idx: int, offsets: List[int]) -> List[int]:
         if 0 <= idx < len(state.slices):
             indices.append(idx)
     return indices
+
+
+def _lcd_stack_indices(base_idx: int) -> List[int]:
+    """Return a 4-slice LCD window even if the user clicked slice 9, 10, or 11."""
+    n = len(state.slices)
+    if n <= 0:
+        return []
+    if base_idx + 3 < n:
+        return [base_idx + i for i in range(4)]
+    if base_idx - 3 >= 0:
+        start = base_idx - 3
+        return [start + i for i in range(4)]
+    start = max(0, min(base_idx, n - 4))
+    return [i for i in range(start, min(start + 4, n))]
+
+
+LCD_SLICE_ANGLE_OFFSETS_DEG = {8: 0.0, 9: 9.0, 10: 18.0, 11: 27.0}
+
+
+def _geometric_slice_score(arr: np.ndarray, pixel_spacing_mm: float = 1.0) -> float:
+    """Score axial ACR geometry slice by detecting the large dark central insert."""
+    try:
+        cr, cc, r0 = find_phantom_circle(arr, pixel_spacing_mm)
+    except Exception:
+        return 0.0
+    h, w = arr.shape
+    cr = int(np.clip(round(cr), 0, h - 1))
+    cc = int(np.clip(round(cc), 0, w - 1))
+    r0 = float(max(r0, 1.0))
+    rr, col = np.ogrid[:h, :w]
+    dist = np.sqrt((rr - cr) ** 2 + (col - cc) ** 2)
+    phantom = dist <= 0.92 * r0
+    central_square = (
+        (np.abs(rr - cr) <= 0.42 * r0) &
+        (np.abs(col - cc) <= 0.42 * r0)
+    )
+    water_ring = (dist >= 0.52 * r0) & (dist <= 0.88 * r0)
+    if not np.any(phantom) or not np.any(central_square) or not np.any(water_ring):
+        return 0.0
+
+    water = float(np.median(arr[water_ring]))
+    background = float(np.percentile(arr[~phantom], 70)) if np.any(~phantom) else float(np.percentile(arr, 5))
+    dark_thr = background + 0.35 * (water - background)
+    dark_fraction = float(np.mean(arr[central_square] <= dark_thr))
+    water_fraction = float(np.mean(arr[water_ring] > dark_thr))
+
+    # Reward a broad, square-ish dark insert near the center; penalize weak water ring.
+    if dark_fraction < 0.18 or water_fraction < 0.35:
+        return 0.0
+    expected_insert_area = (0.84 * r0) ** 2
+    area_term = min(1.0, dark_fraction * central_square.sum() / max(expected_insert_area, 1.0))
+    return float(100.0 * dark_fraction * water_fraction * (0.55 + 0.45 * area_term))
+
+
+def _suggest_slice_assignments() -> Dict[str, int]:
+    n = len(state.slices)
+    assignments: Dict[str, int] = {}
+    if n <= 0:
+        return assignments
+
+    defaults = {
+        "geometric": min(4, n - 1),
+        "resolution": 0,
+        "slice_thickness": 0,
+        "slice_position": 0,
+        "piu": min(6, n - 1),
+        "psg": min(6, n - 1),
+        "low_contrast": min(7, n - 1),
+        "snr": min(6, n - 1),
+        "snru": min(6, n - 1),
+    }
+    assignments.update({k: v for k, v in defaults.items() if 0 <= v < n})
+
+    scores = [
+        _geometric_slice_score(sl.pixel_array, sl.pixel_spacing_mm)
+        for sl in state.slices
+    ]
+    if scores:
+        best_idx = int(np.argmax(scores))
+        if scores[best_idx] > 5.0:
+            assignments["geometric"] = best_idx
+    return assignments
 
 
 def _analyze_slice_position_pair(base_idx: int, kwargs: Optional[dict] = None) -> dict:
@@ -235,86 +335,46 @@ def _analyze_low_contrast_stack(base_idx: int, kwargs: Optional[dict] = None) ->
     kwargs = dict(kwargs or {})
     active_idx = kwargs.pop("active_slice_idx", base_idx)
     overrides = kwargs.pop("lcd_overrides", {}) or {}
-    indices = _valid_slice_indices(base_idx, [0, 1, 2, 3])
+    indices = _lcd_stack_indices(base_idx)
     per_slice = []
     primary = None
     total_visible = 0
-
-    def _lcd_score(result: dict) -> float:
-        score = float(result.get("n_visible", 0)) * 1000.0
-        for spoke in result.get("spokes", []):
-            disks = spoke.get("disks", [])
-            if disks:
-                score += min(float(d.get("cnr", 0.0)) for d in disks)
-            if spoke.get("complete"):
-                score += 5.0
-        return score
-
-    def _best_lcd_for_slice(idx: int, base_kwargs: dict, angles, radii) -> dict:
-        sl = state.slices[idx]
-        best = None
-        best_score = -1e18
-        for radius in radii:
-            for angle in angles:
-                trial_kwargs = dict(base_kwargs)
-                trial_kwargs["lcd_ring_radius_mm"] = float(radius)
-                trial_kwargs["lcd_angle_offset_deg"] = float(angle)
-                result = calculate_low_contrast(sl.pixel_array, sl.pixel_spacing_mm, **trial_kwargs)
-                score = _lcd_score(result)
-                if score > best_score:
-                    best = result
-                    best_score = score
-        return best
-
-    anchor_idx = indices[-1] if indices else base_idx
-    anchor_override = dict(overrides.get(str(anchor_idx), overrides.get(anchor_idx, {})))
-    if anchor_idx == active_idx:
-        anchor_override.update(kwargs)
-    if "lcd_ring_radius_mm" in anchor_override or "lcd_angle_offset_deg" in anchor_override:
-        anchor_result = calculate_low_contrast(
-            state.slices[anchor_idx].pixel_array,
-            state.slices[anchor_idx].pixel_spacing_mm,
-            **anchor_override,
-        )
-    else:
-        anchor_result = _best_lcd_for_slice(
-            anchor_idx,
-            anchor_override,
-            angles=[a for a in range(-18, 19, 3)],
-            radii=[r for r in range(32, 49, 2)],
-        )
-    anchor_angle = float(anchor_result.get("lcd_angle_offset_deg", 0.0))
-    anchor_radius = float(anchor_result.get("lcd_ring_radius_mm", 40.0))
-    anchor_center = anchor_result.get("center_rc")
-    anchor_phantom_radius = anchor_result.get("radius_px")
+    active_pos = indices.index(active_idx) if active_idx in indices else 0
+    active_acr_slice = 8 + active_pos
+    active_lcd_angle = kwargs.get("lcd_angle_offset_deg")
 
     for pos, idx in enumerate(indices):
         sl = state.slices[idx]
         slice_kwargs = dict(overrides.get(str(idx), overrides.get(idx, {})))
+        acr_slice = 8 + pos
         if idx == active_idx:
             slice_kwargs.update(kwargs)
-        if slice_kwargs:
-            result = calculate_low_contrast(sl.pixel_array, sl.pixel_spacing_mm, **slice_kwargs)
-        elif idx == anchor_idx:
-            result = anchor_result
-        else:
-            propagated = {}
-            if anchor_center:
-                propagated["center_rc"] = anchor_center
-            if anchor_phantom_radius:
-                propagated["radius_px"] = anchor_phantom_radius
-            result = _best_lcd_for_slice(
-                idx,
-                propagated,
-                angles=[anchor_angle + d for d in (-6, -3, 0, 3, 6)],
-                radii=[max(20.0, anchor_radius + d) for d in (-2, 0, 2)],
-            )
-        result["slice_number_acr"] = 8 + pos
+        elif not slice_kwargs:
+            slice_kwargs.update({
+                k: v for k, v in kwargs.items()
+                if k in {
+                    "lcd_angle_offset_deg",
+                    "lcd_ring_radius_mm",
+                    "lcd_method",
+                    "center_rc",
+                    "radius_px",
+                    "lcd_anchor_outer_rc",
+                }
+            })
+        if active_lcd_angle is not None and idx != active_idx:
+            ref_offset = LCD_SLICE_ANGLE_OFFSETS_DEG.get(active_acr_slice, 0.0)
+            dst_offset = LCD_SLICE_ANGLE_OFFSETS_DEG.get(acr_slice, 0.0)
+            slice_kwargs["lcd_angle_offset_deg"] = float(active_lcd_angle) + dst_offset - ref_offset
+            slice_kwargs.pop("lcd_anchor_outer_rc", None)
+        slice_kwargs.setdefault("lcd_acr_slice_number", acr_slice)
+        slice_kwargs.setdefault("lcd_method", "manual")
+        result = calculate_low_contrast(sl.pixel_array, sl.pixel_spacing_mm, **slice_kwargs)
+        result["slice_number_acr"] = acr_slice
         result["slice_idx"] = idx
         result["slice_location"] = sl.slice_location
         per_slice.append(result)
         total_visible += int(result.get("n_visible", 0))
-        if idx == base_idx:
+        if idx == active_idx:
             primary = result
     if primary is None and per_slice:
         primary = per_slice[0]
@@ -338,9 +398,9 @@ def _analyze_low_contrast_stack(base_idx: int, kwargs: Optional[dict] = None) ->
     primary["passed"] = total_visible >= t2_limit
     primary["field_T"] = field_T
     primary["analysis_scope"] = "slices_8_to_11"
-    primary["lcd_anchor_slice"] = 11
-    primary["lcd_anchor_angle_offset_deg"] = round(anchor_angle, 2)
-    primary["lcd_anchor_ring_radius_mm"] = round(anchor_radius, 2)
+    primary["lcd_anchor_slice"] = None
+    primary["lcd_anchor_angle_offset_deg"] = primary.get("lcd_angle_offset_deg")
+    primary["lcd_anchor_ring_radius_mm"] = primary.get("lcd_ring_radius_mm")
     return primary
 
 
@@ -399,6 +459,61 @@ async def health():
     return {"status": "ok", "version": "1.0.0", "modality": "MRI"}
 
 
+# ==============================================================================
+# FILESYSTEM BROWSING
+# ==============================================================================
+
+@app.get("/browse-fs")
+async def browse_filesystem(path: str = Query("")):
+    """Browse filesystem directories for DICOM folder selection."""
+    import string
+
+    if not path:
+        # Return drives on Windows, root on Unix
+        if sys.platform == "win32":
+            drives = []
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if os.path.isdir(drive):
+                    drives.append({"name": f"{letter}:", "path": drive, "is_dir": True})
+            return {"current": "", "parent": "", "entries": drives}
+        else:
+            path = "/"
+
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        raise HTTPException(400, f"Non è una directory: {path}")
+
+    parent = os.path.dirname(path)
+    if parent == path:
+        parent = ""  # root
+
+    entries = []
+    try:
+        for name in sorted(os.listdir(path)):
+            full = os.path.join(path, name)
+            if name.startswith("."):
+                continue
+            is_dir = os.path.isdir(full)
+            entry = {"name": name, "path": full, "is_dir": is_dir}
+            if not is_dir:
+                entry["size"] = os.path.getsize(full)
+            entries.append(entry)
+    except PermissionError:
+        pass
+
+    # Count DICOM-like files (no extension or common DICOM extensions)
+    dicom_count = sum(1 for e in entries if not e["is_dir"] and
+                      (not "." in e["name"] or e["name"].lower().endswith((".dcm", ".ima"))))
+
+    return {
+        "current": path,
+        "parent": parent,
+        "entries": entries[:500],  # limit to 500 entries
+        "dicom_file_count": dicom_count,
+    }
+
+
 @app.post("/load-dicom")
 async def load_dicom(req: LoadRequest):
     if not os.path.isdir(req.input_dir):
@@ -407,16 +522,53 @@ async def load_dicom(req: LoadRequest):
     try:
         state.reset()
         state.input_dir = req.input_dir
-        state.slices = load_dicom_series(req.input_dir)
-        logger.info("Loaded %d MRI slices from %s", len(state.slices), req.input_dir)
+        all_loaded = load_dicom_series(req.input_dir, recursive=req.recursive)
+        state.all_slices = all_loaded
+        logger.info("Loaded %d MRI slices from %s", len(all_loaded), req.input_dir)
+
+        # Group by series_instance_uid
+        groups: Dict[str, List[DicomSlice]] = {}
+        for sl in all_loaded:
+            uid = sl.series_instance_uid or "unknown"
+            groups.setdefault(uid, []).append(sl)
+
+        # Auto-select first T1 sequence (TR < 1000) or fall back to largest group
+        selected_uid = ""
+        for uid, slices in groups.items():
+            if slices and slices[0].tr_ms > 0 and slices[0].tr_ms < 1000:
+                selected_uid = uid
+                break
+        if not selected_uid:
+            # Fall back to the group with the most slices
+            selected_uid = max(groups.keys(), key=lambda u: len(groups[u]))
+
+        state.active_sequence_uid = selected_uid
+        state.slices = groups.get(selected_uid, all_loaded)
 
         stats = get_series_stats(state.slices)
+
+        # Build sequences summary
+        sequences_info = []
+        for uid, grp in groups.items():
+            rep = grp[0]
+            sequences_info.append({
+                "uid": uid,
+                "description": rep.series_description,
+                "tr_ms": rep.tr_ms,
+                "te_ms": rep.te_ms,
+                "n_slices": len(grp),
+                "is_active": uid == selected_uid,
+            })
 
         return NumpyJSONResponse({
             "success": True,
             "n_slices": len(state.slices),
+            "n_total_slices": len(all_loaded),
+            "active_sequence_uid": selected_uid,
+            "sequences": sequences_info,
             "stats": stats,
             "slices": [_slice_summary(sl, i) for i, sl in enumerate(state.slices)],
+            "suggested_assignments": _suggest_slice_assignments(),
         })
     except Exception as e:
         traceback.print_exc()
@@ -460,6 +612,13 @@ async def get_module_config():
         "modules": ACR_MODULES,
         "module_order": MODULE_ORDER,
     }
+
+
+@app.get("/suggest-slices")
+async def suggest_slices():
+    if not state.slices:
+        raise HTTPException(400, "Nessuna serie caricata")
+    return {"assignments": _suggest_slice_assignments()}
 
 
 @app.post("/assign-slices")
@@ -516,8 +675,14 @@ async def analyze_module(req: AnalyzeRequest):
             snr_idx2 = kwargs.pop("second_slice_idx", None)
             snr_method = kwargs.pop("snr_method", "single_lr")
             if snr_method == "two_image" and snr_idx2 is not None and 0 <= snr_idx2 < len(state.slices):
+                if int(snr_idx2) == int(idx):
+                    raise HTTPException(400, "Per two_image_subtraction scegli una seconda immagine diversa dalla corrente")
                 arr2 = state.slices[snr_idx2].pixel_array
                 result = calculate_snr_two_images(arr, arr2, ps, **kwargs)
+                result["primary_slice_idx"] = idx
+                result["second_slice_idx"] = int(snr_idx2)
+                result["primary_slice_location"] = sl.slice_location
+                result["second_slice_location"] = state.slices[snr_idx2].slice_location
             else:
                 result = calculate_snr_single_image(arr, ps, **kwargs)
                 # Add method info
@@ -755,6 +920,286 @@ def _generate_overlay(module: str, sl: DicomSlice, result: dict) -> str:
     plt.close(fig)
     buf.seek(0)
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+# ==============================================================================
+# MULTI-SEQUENCE & SESSION PERSISTENCE ENDPOINTS
+# ==============================================================================
+
+@app.get("/sequences")
+async def get_sequences():
+    """Returns list of detected sequences grouped by series_instance_uid."""
+    if not state.all_slices:
+        raise HTTPException(400, "Nessuna serie caricata")
+
+    groups: Dict[str, List[DicomSlice]] = {}
+    for sl in state.all_slices:
+        uid = sl.series_instance_uid or "unknown"
+        groups.setdefault(uid, []).append(sl)
+
+    sequences = []
+    for uid, grp in groups.items():
+        rep = grp[0]
+        sequences.append({
+            "uid": uid,
+            "description": rep.series_description,
+            "tr_ms": rep.tr_ms,
+            "te_ms": rep.te_ms,
+            "n_slices": len(grp),
+            "is_active": uid == state.active_sequence_uid,
+        })
+
+    return {"sequences": sequences}
+
+
+@app.post("/set-active-sequence")
+async def set_active_sequence(req: SetActiveSequenceRequest):
+    """Switch to a specific sequence by series_instance_uid."""
+    if not state.all_slices:
+        raise HTTPException(400, "Nessuna serie caricata")
+
+    # Save current results before switching
+    if state.active_sequence_uid and state.results:
+        state.all_results[state.active_sequence_uid] = dict(state.results)
+
+    # Find slices for the requested UID
+    matching = [sl for sl in state.all_slices if sl.series_instance_uid == req.uid]
+    if not matching:
+        raise HTTPException(404, f"Sequenza con UID '{req.uid}' non trovata")
+
+    state.active_sequence_uid = req.uid
+    state.slices = matching
+    state.assigned_slices = {}
+    state.results = state.all_results.get(req.uid, {})
+
+    return NumpyJSONResponse({
+        "success": True,
+        "active_sequence_uid": req.uid,
+        "n_slices": len(state.slices),
+        "slices": [_slice_summary(sl, i) for i, sl in enumerate(state.slices)],
+        "suggested_assignments": _suggest_slice_assignments(),
+    })
+
+
+def _build_session_data() -> dict:
+    """Build the full session dict for JSON persistence (no pixel data or overlays)."""
+    # Save current sequence results
+    if state.active_sequence_uid and state.results:
+        state.all_results[state.active_sequence_uid] = dict(state.results)
+
+    # Group slices by UID
+    groups: Dict[str, List[DicomSlice]] = {}
+    for sl in state.all_slices:
+        uid = sl.series_instance_uid or "unknown"
+        groups.setdefault(uid, []).append(sl)
+
+    # DICOM meta from first slice of active sequence
+    dicom_meta = {}
+    if state.slices:
+        sl0 = state.slices[0]
+        dicom_meta = {
+            "manufacturer": sl0.manufacturer,
+            "model": sl0.model_name,
+            "institution": sl0.institution_name,
+            "station": sl0.station_name,
+            "protocol": sl0.protocol_name,
+            "magnetic_field_T": sl0.magnetic_field_T,
+            "study_date": sl0.study_date,
+            "serial_number": sl0.serial_number,
+        }
+
+    # Build per-sequence data
+    sequences_data = []
+    for uid, grp in groups.items():
+        rep = grp[0]
+        # Get results for this sequence (strip overlay images)
+        seq_results = state.all_results.get(uid, {})
+        clean_results = {}
+        for module, res in seq_results.items():
+            clean = {k: v for k, v in res.items()
+                     if k not in ("overlay_image", "pixel_array")}
+            # Also strip overlay from nested lcd_slices / slice_position_slices
+            for nested_key in ("lcd_slices", "slice_position_slices"):
+                if nested_key in clean and isinstance(clean[nested_key], list):
+                    clean[nested_key] = [
+                        {k2: v2 for k2, v2 in item.items()
+                         if k2 not in ("overlay_image", "pixel_array")}
+                        for item in clean[nested_key]
+                    ]
+            clean_results[module] = clean
+
+        sequences_data.append({
+            "uid": uid,
+            "series_description": rep.series_description,
+            "tr_ms": rep.tr_ms,
+            "te_ms": rep.te_ms,
+            "n_slices": len(grp),
+            "slices": [
+                {
+                    "filename": s.filename,
+                    "z": round(s.slice_location, 2),
+                    "thickness": round(s.slice_thickness_mm, 2),
+                    "instance": s.instance_number,
+                }
+                for s in grp
+            ],
+            "results": clean_results,
+        })
+
+    return {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "input_dir": state.input_dir,
+        "active_sequence_uid": state.active_sequence_uid,
+        "assigned_slices": state.assigned_slices,
+        "meta_info": state.meta_info,
+        "dicom_meta": dicom_meta,
+        "sequences": sequences_data,
+    }
+
+
+@app.post("/save-session")
+async def save_session(req: SaveSessionRequest):
+    """Save current analysis session to a JSON file."""
+    if not state.all_slices:
+        raise HTTPException(400, "Nessuna serie caricata — nulla da salvare")
+
+    filepath = req.filepath.strip() if req.filepath else ""
+    if not filepath:
+        # Auto-generate filename in input_dir
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"mri_qc_session_{ts}.json"
+        base_dir = state.input_dir if state.input_dir and os.path.isdir(state.input_dir) else "."
+        filepath = os.path.join(base_dir, filename)
+
+    try:
+        session_data = _build_session_data()
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            _json.dump(session_data, f, cls=_NumpyEncoder, ensure_ascii=False, indent=2)
+        logger.info("Session saved to %s", filepath)
+        return {"success": True, "filepath": os.path.abspath(filepath)}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"Errore salvataggio sessione: {e}")
+
+
+@app.post("/load-session")
+async def load_session(req: LoadSessionRequest):
+    """Load a previously saved session from a JSON file."""
+    filepath = req.filepath.strip()
+    if not filepath or not os.path.isfile(filepath):
+        raise HTTPException(400, f"File sessione non trovato: {filepath}")
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        logger.info("Session loaded from %s", filepath)
+        # Restore meta_info if present
+        if "meta_info" in data and data["meta_info"]:
+            state.meta_info = data["meta_info"]
+        # Restore assigned_slices if present
+        if "assigned_slices" in data and data["assigned_slices"]:
+            state.assigned_slices = data["assigned_slices"]
+        # Restore all_results from sequences
+        if "sequences" in data:
+            for seq in data["sequences"]:
+                uid = seq.get("uid", "")
+                if uid and "results" in seq:
+                    state.all_results[uid] = seq["results"]
+            # If active sequence matches, restore its results
+            active_uid = data.get("active_sequence_uid", "")
+            if active_uid and active_uid in state.all_results:
+                state.results = state.all_results[active_uid]
+        return {"success": True, "data": data}
+    except _json.JSONDecodeError as e:
+        raise HTTPException(400, f"File JSON non valido: {e}")
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"Errore caricamento sessione: {e}")
+
+
+# ==============================================================================
+# RELAXOMETRY ENDPOINT
+# ==============================================================================
+
+
+class RelaxometryRequest(BaseModel):
+    slice_idx: int = 0
+    roi_fraction: float = 0.75
+
+
+@app.post("/relaxometry")
+async def analyze_relaxometry(req: RelaxometryRequest):
+    """Estimate T1/T2 relaxation from multiple sequences at the same slice location.
+
+    Groups all loaded sequences by slice location, collects signal at different
+    TR/TE values, and fits exponential decay/recovery models.
+    """
+    if not state.all_slices:
+        raise HTTPException(400, "Nessuna serie caricata")
+
+    # Group all slices by series UID
+    groups: Dict[str, List[DicomSlice]] = {}
+    for sl in state.all_slices:
+        uid = sl.series_instance_uid or "unknown"
+        groups.setdefault(uid, []).append(sl)
+
+    if len(groups) < 2:
+        raise HTTPException(400, "Servono almeno 2 sequenze diverse per la relassometria")
+
+    # Get the target z-location from the active sequence
+    if req.slice_idx < 0 or req.slice_idx >= len(state.slices):
+        raise HTTPException(400, f"Indice slice {req.slice_idx} non valido")
+
+    target_z = state.slices[req.slice_idx].slice_location
+    ps = state.slices[req.slice_idx].pixel_spacing_mm
+
+    # Find matching slices at the same z-location from all sequences
+    tolerance_mm = 2.0  # Allow 2mm tolerance for matching z positions
+    slices_data = []
+    for uid, grp in groups.items():
+        # Find the closest slice to target_z in this group
+        best = None
+        best_dist = float("inf")
+        for sl in grp:
+            d = abs(sl.slice_location - target_z)
+            if d < best_dist:
+                best_dist = d
+                best = sl
+        if best is not None and best_dist <= tolerance_mm:
+            slices_data.append({
+                "pixel_array": best.pixel_array,
+                "tr_ms": best.tr_ms,
+                "te_ms": best.te_ms,
+                "series_description": best.series_description,
+                "uid": uid,
+            })
+
+    if len(slices_data) < 2:
+        raise HTTPException(400,
+            f"Solo {len(slices_data)} sequenza trovata alla posizione z={target_z:.1f} mm. "
+            "Servono almeno 2 sequenze con slice alla stessa posizione.")
+
+    try:
+        result = calculate_relaxometry(slices_data, ps, roi_fraction=req.roi_fraction)
+        # Add sequence info
+        result["sequences_used"] = [
+            {
+                "uid": sd["uid"],
+                "description": sd["series_description"],
+                "tr_ms": sd["tr_ms"],
+                "te_ms": sd["te_ms"],
+            }
+            for sd in slices_data
+        ]
+        result["target_z_mm"] = round(float(target_z), 2)
+        result["slice_idx"] = req.slice_idx
+
+        return NumpyJSONResponse({"success": True, "results": result})
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"Errore relassometria: {e}")
 
 
 # ==============================================================================
