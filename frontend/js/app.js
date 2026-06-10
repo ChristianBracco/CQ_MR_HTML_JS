@@ -333,7 +333,21 @@
       </div>
     </div>`;
 
-    await loadBaseImage(idx, 500, 1000);
+    // Use optimal WL/WW per module
+    let defaultWL = 500, defaultWW = 1000;
+    if (mod === "low_contrast") {
+      // LCD needs narrow window to see low-contrast objects
+      // ACR recommends: narrow window, level ~ mean water signal
+      defaultWL = 450;
+      defaultWW = 250;
+    }
+    await loadBaseImage(idx, defaultWL, defaultWW);
+    // Update sliders to reflect
+    const wlSlider = document.getElementById("mod-wl");
+    const wwSlider = document.getElementById("mod-ww");
+    if (wlSlider) wlSlider.value = defaultWL;
+    if (wwSlider) wwSlider.value = defaultWW;
+
     if (AppState.results[mod]) {
       renderResults(mod, AppState.results[mod]);
       // Draw ROIs client-side on overlay
@@ -789,32 +803,51 @@
         ctx.setLineDash([]);
       }
 
-      // Draw grid insert square (always visible on geometric slice)
-      // The insert is ~148mm for Large (78% of 190mm diameter) or ~120mm for Medium
+      // Draw grid insert square and 9 reference points
       if (cr !== null && r0 > 0) {
-        const insertFraction = (r.nominal_diameter_mm >= 180) ? 0.78 : 0.73;
-        const insertHalfPx = r0 * insertFraction;
+        // Use detected insert_roi if available, otherwise estimate from radius
+        let sqTop, sqLeft, sqW, sqH;
+        if (r.grid_distortion && r.grid_distortion.insert_roi_rc) {
+          [sqTop, sqLeft, sqH, sqW] = r.grid_distortion.insert_roi_rc;
+          // Validate: if the rect is bigger than the phantom, use estimate
+          if (sqW > r0 * 1.6 || sqH > r0 * 1.6) {
+            const half = r0 * 0.6;
+            sqTop = cr - half; sqLeft = cc - half; sqW = half * 2; sqH = half * 2;
+          }
+        } else {
+          const half = r0 * 0.6;
+          sqTop = cr - half; sqLeft = cc - half; sqW = half * 2; sqH = half * 2;
+        }
         ctx.strokeStyle = "#fbbf24";
         ctx.lineWidth = 1.5;
         ctx.setLineDash([4, 3]);
-        ctx.strokeRect(cc - insertHalfPx, cr - insertHalfPx, insertHalfPx * 2, insertHalfPx * 2);
+        ctx.strokeRect(sqLeft, sqTop, sqW, sqH);
         ctx.setLineDash([]);
       }
 
-      // Draw grid dots if detected
+      // Draw the 9 detected grid points
       if (Array.isArray(r.grid_dots) && r.grid_dots.length > 0) {
         ctx.fillStyle = "#fbbf24";
-        ctx.globalAlpha = 0.85;
-        for (const dot of r.grid_dots) {
+        ctx.strokeStyle = "#fbbf24";
+        ctx.lineWidth = 1;
+        for (let i = 0; i < r.grid_dots.length; i++) {
+          const dot = r.grid_dots[i];
           ctx.beginPath();
-          ctx.arc(dot[1], dot[0], 3, 0, 2 * Math.PI);
+          ctx.arc(dot[1], dot[0], 4, 0, 2 * Math.PI);
           ctx.fill();
+          // Cross marker for visibility
+          ctx.beginPath();
+          ctx.moveTo(dot[1] - 6, dot[0]);
+          ctx.lineTo(dot[1] + 6, dot[0]);
+          ctx.moveTo(dot[1], dot[0] - 6);
+          ctx.lineTo(dot[1], dot[0] + 6);
+          ctx.stroke();
         }
-        ctx.globalAlpha = 1.0;
         const nDots = r.grid_distortion ? r.grid_distortion.n_dots_detected : r.grid_dots.length;
-        strokeText(`${nDots} punti griglia`, cc, cr - (r0 * 0.78) - 8, "#fbbf24", "bold 10px sans-serif");
-      } else if (r.grid_distortion && r.grid_distortion.n_dots_detected > 0) {
-        strokeText(`${r.grid_distortion.n_dots_detected} punti`, cc, cr - (r0 * 0.78) - 8, "#fbbf24", "bold 10px sans-serif");
+        if (r.grid_distortion && r.grid_distortion.mean_ratio) {
+          const labelY = r.grid_dots[0] ? r.grid_dots[0][0] - 12 : cr - r0 * 0.65;
+          strokeText(`${nDots} pts | ratio ${r.grid_distortion.mean_ratio.toFixed(3)}`, cc, labelY, "#fbbf24", "bold 9px sans-serif");
+        }
       }
 
       // Pass/fail title
@@ -1189,6 +1222,16 @@
       }
     }
 
+    // Test grid reference points (yellow dots) — draggable
+    if (Array.isArray(r.grid_dots) && r.grid_dots.length > 0) {
+      for (let i = 0; i < r.grid_dots.length; i++) {
+        const [dr, dc] = r.grid_dots[i];
+        if (Math.hypot(col - dc, row - dr) <= 8) {
+          return { type: "grid_dot", index: i };
+        }
+      }
+    }
+
     // Test geometric H line (orange, horizontal) — draggable vertically
     if (r.h_line_row !== undefined && r.center_rc && r.radius_px) {
       const [hcr, hcc] = r.center_rc;
@@ -1291,6 +1334,13 @@
     } else if (_dragState.type === "v_line" && r.v_line_col !== undefined) {
       // Move vertical measurement line horizontally only
       r.v_line_col += dc;
+    } else if (_dragState.type === "grid_dot" && Array.isArray(r.grid_dots)) {
+      // Move grid reference point
+      const idx = _dragState.index;
+      if (r.grid_dots[idx]) {
+        r.grid_dots[idx][0] += dr;
+        r.grid_dots[idx][1] += dc;
+      }
     }
 
     // Redraw overlay with updated positions (immediate visual feedback)
@@ -1529,9 +1579,15 @@
       <div class="result-section">
         <h4>Distorsione Geometrica (Grid)</h4>
         <div class="summary-row info"><span class="summary-label">Punti rilevati</span><span class="summary-value">${r.grid_distortion ? r.grid_distortion.n_dots_detected : (r.grid_dots ? r.grid_dots.length : 0)}</span></div>
-        ${r.grid_distortion ? `<div class="summary-row info"><span class="summary-label">Spaziatura mediana</span><span class="summary-value">${UI.fmt(r.grid_distortion.median_spacing_mm, 2)} mm</span></div>
-        <div class="summary-row info"><span class="summary-label">Dev. std spaziatura</span><span class="summary-value">${UI.fmt(r.grid_distortion.spacing_std_mm, 2)} mm</span></div>
-        <div class="summary-row info"><span class="summary-label">Max deviazione</span><span class="summary-value">${UI.fmt(r.grid_distortion.max_spacing_deviation_mm, 2)} mm</span></div>` : '<div class="summary-row info"><span class="summary-label">Stato</span><span class="summary-value">Griglia non rilevata su questa slice</span></div>'}
+        ${r.grid_distortion && r.grid_distortion.segments ? `
+        <div class="summary-row info"><span class="summary-label">Rapporto medio</span><span class="summary-value">${UI.fmt(r.grid_distortion.mean_ratio, 4)}</span></div>
+        <div class="summary-row info"><span class="summary-label">Max errore</span><span class="summary-value">${UI.fmt(r.grid_distortion.max_abs_error_mm, 2)} mm</span></div>
+        <table class="report-mini-table" style="margin-top:6px;font-size:10px;color:var(--text-primary);background:var(--bg-primary);">
+          <thead><tr style="color:var(--text-secondary);"><th>Segmento</th><th>Dir</th><th>Misurato</th><th>Nominale</th><th>Rapporto</th></tr></thead>
+          <tbody>${r.grid_distortion.segments.map(s => 
+            '<tr><td>' + s.label + '</td><td>' + s.direction + '</td><td>' + s.measured_mm + ' mm</td><td>' + s.nominal_mm + ' mm</td><td><strong>' + s.ratio + '</strong></td></tr>'
+          ).join('')}</tbody>
+        </table>` : '<div class="summary-row info"><span class="summary-label">Stato</span><span class="summary-value">Griglia non rilevata su questa slice</span></div>'}
       </div>
       <div class="result-section">
         <h4>Profili lineari ROI</h4>

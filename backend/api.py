@@ -282,7 +282,7 @@ def _suggest_slice_assignments() -> Dict[str, int]:
         "slice_position": 0,
         "piu": min(6, n - 1),
         "psg": min(6, n - 1),
-        "low_contrast": min(7, n - 1),
+        "low_contrast": n - 1,
         "snr": min(6, n - 1),
         "snru": min(6, n - 1),
     }
@@ -1207,7 +1207,25 @@ async def analyze_relaxometry(req: RelaxometryRequest):
 # ==============================================================================
 
 if os.path.isdir(FRONTEND_DIR):
-    app.mount("/frontend", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+    from starlette.staticfiles import StaticFiles as _SF
+    from starlette.responses import Response as _Resp
+
+    class NoCacheStaticFiles(_SF):
+        async def __call__(self, scope, receive, send):
+            """Wrapper that adds no-cache headers to all static files."""
+            async def send_with_headers(message):
+                if message.get("type") == "http.response.start":
+                    headers = dict(message.get("headers", []))
+                    # Add cache-busting headers
+                    new_headers = list(message.get("headers", []))
+                    new_headers.append((b"cache-control", b"no-cache, no-store, must-revalidate"))
+                    new_headers.append((b"pragma", b"no-cache"))
+                    new_headers.append((b"expires", b"0"))
+                    message["headers"] = new_headers
+                await send(message)
+            await super().__call__(scope, receive, send_with_headers)
+
+    app.mount("/frontend", NoCacheStaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
 
 
 # ==============================================================================

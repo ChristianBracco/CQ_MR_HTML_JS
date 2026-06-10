@@ -622,132 +622,161 @@ def calculate_snru(arr: np.ndarray, pixel_spacing_mm: float = 1.0,
 
 
 def _detect_grid_dots(arr, cr, cc, r0, pixel_spacing_mm, nominal_diameter_mm):
-    """Detect grid line intersections in the ACR phantom geometric insert.
+    """Detect the square insert and its 9 reference points.
 
-    The ACR Large phantom slice 5 has a grid of dark lines (acrylic) forming
-    a square pattern. The grid intersections (where horizontal and vertical
-    dark lines cross) are used as reference points for geometric distortion
-    measurement.
-
-    Method: detect dark grid lines using projection profiles (sum along rows
-    and columns), find their intersections as grid nodes.
+    Finds the square insert by detecting its edges in the annular region
+    between the insert and the phantom wall. Then computes 9 reference
+    points (4 corners, 4 midpoints, 1 center) and measures segment ratios.
 
     Returns:
         (dots_list, distortion_dict)
     """
-    from scipy import ndimage
+    from scipy.ndimage import uniform_filter, sobel
 
     h, w = arr.shape
     px = float(pixel_spacing_mm)
 
-    # The grid insert is ~148mm for Large, ~120mm for Medium
-    insert_half_mm = 74.0 if nominal_diameter_mm >= 180 else 60.0
+    # Expected insert size
+    insert_side_mm = 148.0 if nominal_diameter_mm >= 180 else 120.0
+    insert_half_mm = insert_side_mm / 2.0
     insert_half_px = insert_half_mm / px
 
-    # Restrict to central square
-    r_min = int(max(0, cr - insert_half_px))
-    r_max = int(min(h - 1, cr + insert_half_px))
-    c_min = int(max(0, cc - insert_half_px))
-    c_max = int(min(w - 1, cc + insert_half_px))
+    # Strategy: find the 4 edges of the square by scanning profiles
+    # from center outward in 4 cardinal directions (up, down, left, right)
+    # The edge is where signal drops sharply (water -> acrylic border of insert)
 
-    roi = arr[r_min:r_max + 1, c_min:c_max + 1].astype(np.float64)
-    rh, rw = roi.shape
-    if rh < 20 or rw < 20:
-        return [], None
+    def _find_edge_from_center(arr, cr, cc, direction, max_dist_px):
+        """Scan from center outward to find the insert edge."""
+        # direction: 0=up(-row), 1=right(+col), 2=down(+row), 3=left(-col)
+        dr = [-1, 0, 1, 0][direction]
+        dc = [0, 1, 0, -1][direction]
 
-    # Normalize ROI
-    roi_min = float(np.min(roi))
-    roi_max = float(np.max(roi))
-    if roi_max - roi_min < 1:
-        return [], None
-    roi_norm = (roi - roi_min) / (roi_max - roi_min)
+        # Sample profile from center outward
+        positions = []
+        values = []
+        for d in range(5, int(max_dist_px)):
+            r = int(round(cr + d * dr))
+            c = int(round(cc + d * dc))
+            if r < 0 or r >= h or c < 0 or c >= w:
+                break
+            positions.append(d)
+            values.append(float(arr[r, c]))
 
-    # The grid lines are DARK on a bright background
-    # Invert: grid lines become bright
-    roi_inv = 1.0 - roi_norm
+        if len(values) < 20:
+            return insert_half_px  # fallback to nominal
 
-    # Find grid lines using projection profiles
-    # Sum along columns -> horizontal profile (detects vertical lines)
-    h_profile = np.mean(roi_inv, axis=0)
-    # Sum along rows -> vertical profile (detects horizontal lines)
-    v_profile = np.mean(roi_inv, axis=1)
-
-    # Find peaks in profiles (grid line positions)
-    # Expected grid spacing: ~15-20 pixels for typical ACR phantom
-    expected_spacing_px = max(5, int(15.0 / px))
-
-    def _find_grid_lines(profile, min_spacing):
-        """Find periodic peaks in a 1D profile."""
+        vals = np.array(values)
         # Smooth
-        k = max(3, len(profile) // 30)
+        k = max(3, len(vals) // 20)
         if k % 2 == 0:
             k += 1
-        smoothed = np.convolve(profile, np.ones(k) / k, mode='same')
+        smoothed = np.convolve(vals, np.ones(k)/k, mode='same')
 
-        # Threshold: peaks above mean + 0.7*std (stricter to avoid false detections)
-        mean_val = float(np.mean(smoothed))
-        std_val = float(np.std(smoothed))
-        threshold = mean_val + 0.7 * std_val
+        # Find the steepest drop (derivative most negative) in the outer region
+        # The insert edge should be around 50-75% of the phantom radius
+        deriv = np.diff(smoothed)
+        search_start = int(0.4 * insert_half_px)
+        search_end = min(len(deriv), int(1.0 * insert_half_px))
 
-        # Find local maxima above threshold with minimum spacing enforcement
-        peaks = []
-        for i in range(2, len(smoothed) - 2):
-            if (smoothed[i] > threshold and
-                smoothed[i] >= smoothed[i-1] and smoothed[i] >= smoothed[i+1] and
-                smoothed[i] >= smoothed[i-2] and smoothed[i] >= smoothed[i+2]):
-                if not peaks or (i - peaks[-1]) >= min_spacing * 0.7:
-                    peaks.append(i)
-        return peaks
+        if search_end <= search_start:
+            return insert_half_px
 
-    v_lines = _find_grid_lines(h_profile, expected_spacing_px)  # vertical line positions (column indices)
-    h_lines = _find_grid_lines(v_profile, expected_spacing_px)  # horizontal line positions (row indices)
+        region = deriv[search_start:search_end]
+        if len(region) < 3:
+            return insert_half_px
 
-    if len(v_lines) < 2 or len(h_lines) < 2:
-        return [], None
+        # Find steepest negative gradient (signal dropping = entering dark edge)
+        min_idx = int(np.argmin(region))
+        edge_pos = float(positions[search_start + min_idx])
+        return edge_pos
 
-    # Grid intersections = all combinations of h_lines and v_lines
-    dot_centers = []
-    for row_pos in h_lines:
-        for col_pos in v_lines:
-            abs_r = row_pos + r_min
-            abs_c = col_pos + c_min
-            dot_centers.append([round(float(abs_r), 1), round(float(abs_c), 1)])
+    # Find 4 edge distances from center
+    max_search = r0 * 0.95
+    edge_up = _find_edge_from_center(arr, cr, cc, 0, max_search)
+    edge_right = _find_edge_from_center(arr, cr, cc, 1, max_search)
+    edge_down = _find_edge_from_center(arr, cr, cc, 2, max_search)
+    edge_left = _find_edge_from_center(arr, cr, cc, 3, max_search)
 
-    if len(dot_centers) < 4:
-        return [], None
+    # The 4 corners and 4 midpoints from the detected edges
+    top = cr - edge_up
+    bottom = cr + edge_down
+    left = cc - edge_left
+    right = cc + edge_right
 
-    dots_arr = np.array(dot_centers)
+    mid_r = (top + bottom) / 2.0
+    mid_c = (left + right) / 2.0
 
-    # Compute grid spacing from the detected line positions
-    if len(v_lines) > 1:
-        v_spacings = np.diff(v_lines) * px
-        h_spacings = np.diff(h_lines) * px if len(h_lines) > 1 else v_spacings
-        all_spacings = np.concatenate([v_spacings, h_spacings])
-        median_spacing_mm = float(np.median(all_spacings))
-        spacing_std_mm = float(np.std(all_spacings))
-        max_deviation_mm = float(np.max(np.abs(all_spacings - median_spacing_mm)))
-    else:
-        median_spacing_mm = 0.0
-        spacing_std_mm = 0.0
-        max_deviation_mm = 0.0
+    # 9 points: corners, midpoints, center
+    detected_points = [
+        [round(top, 1), round(left, 1)],       # 0: top-left
+        [round(top, 1), round(mid_c, 1)],      # 1: top-center
+        [round(top, 1), round(right, 1)],      # 2: top-right
+        [round(mid_r, 1), round(left, 1)],     # 3: mid-left
+        [round(mid_r, 1), round(mid_c, 1)],    # 4: center
+        [round(mid_r, 1), round(right, 1)],    # 5: mid-right
+        [round(bottom, 1), round(left, 1)],    # 6: bot-left
+        [round(bottom, 1), round(mid_c, 1)],   # 7: bot-center
+        [round(bottom, 1), round(right, 1)],   # 8: bot-right
+    ]
 
-    center_dists_px = np.sqrt(
-        (dots_arr[:, 0] - cr) ** 2 + (dots_arr[:, 1] - cc) ** 2
-    )
+    # Measured dimensions
+    width_px = right - left
+    height_px = bottom - top
+    width_mm = width_px * px
+    height_mm = height_px * px
+    nominal_half_w = width_mm / 2.0
+    nominal_half_h = height_mm / 2.0
+    nominal_half_side_mm = insert_side_mm / 2.0
+
+    # Compute segment ratios (measured / nominal)
+    segments = [
+        (0, 1, "H", "top-L"),    (1, 2, "H", "top-R"),
+        (3, 4, "H", "mid-L"),    (4, 5, "H", "mid-R"),
+        (6, 7, "H", "bot-L"),    (7, 8, "H", "bot-R"),
+        (0, 3, "V", "left-T"),   (1, 4, "V", "ctr-T"),
+        (2, 5, "V", "right-T"),  (3, 6, "V", "left-B"),
+        (4, 7, "V", "ctr-B"),    (5, 8, "V", "right-B"),
+    ]
+
+    segment_results = []
+    for ia, ib, direction, label in segments:
+        pa = detected_points[ia]
+        pb = detected_points[ib]
+        dist_px = np.sqrt((pa[0] - pb[0])**2 + (pa[1] - pb[1])**2)
+        dist_mm = dist_px * px
+        ratio = dist_mm / nominal_half_side_mm
+        error_mm = dist_mm - nominal_half_side_mm
+        segment_results.append({
+            "label": label, "direction": direction,
+            "measured_mm": round(dist_mm, 2),
+            "nominal_mm": round(nominal_half_side_mm, 2),
+            "ratio": round(ratio, 4),
+            "error_mm": round(error_mm, 2),
+        })
+
+    ratios = [s["ratio"] for s in segment_results]
+    errors = [s["error_mm"] for s in segment_results]
+    mean_ratio = float(np.mean(ratios))
+    max_error = float(np.max(np.abs(errors)))
 
     distortion_dict = {
-        "n_dots_detected": len(dot_centers),
-        "n_vertical_lines": len(v_lines),
-        "n_horizontal_lines": len(h_lines),
-        "median_spacing_mm": round(median_spacing_mm, 2),
-        "spacing_std_mm": round(spacing_std_mm, 2),
-        "max_spacing_deviation_mm": round(max_deviation_mm, 2),
-        "insert_roi_rc": [r_min, c_min, r_max - r_min, c_max - c_min],
-        "max_radial_distance_mm": round(float(np.max(center_dists_px)) * px, 1),
+        "n_dots_detected": 9,
+        "insert_side_mm": insert_side_mm,
+        "measured_width_mm": round(width_mm, 2),
+        "measured_height_mm": round(height_mm, 2),
+        "nominal_segment_mm": round(nominal_half_side_mm, 1),
+        "segments": segment_results,
+        "mean_ratio": round(mean_ratio, 4),
+        "max_abs_error_mm": round(max_error, 2),
+        "median_spacing_mm": round(nominal_half_side_mm * mean_ratio, 2),
+        "spacing_std_mm": round(float(np.std([s["measured_mm"] for s in segment_results])), 2),
+        "max_spacing_deviation_mm": round(max_error, 2),
+        "insert_roi_rc": [
+            int(top), int(left), int(bottom - top), int(right - left)
+        ],
     }
 
-    dots_list = dot_centers[:500]
-    return dots_list, distortion_dict
+    return detected_points, distortion_dict
 
 
 # ==============================================================================
